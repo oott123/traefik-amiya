@@ -1,0 +1,410 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: claude <noreply@anthropic.com>
+Date: Fri, 7 Aug 2026 20:47:42 +0800
+Subject: [PATCH] Add the AppProtocol TCP rule matcher
+
+Assisted-by: Claude Opus 5
+---
+ pkg/muxer/tcp/matcher.go      |  25 +++++
+ pkg/muxer/tcp/matcher_test.go | 196 ++++++++++++++++++++++++++++++++++
+ pkg/muxer/tcp/mux.go          |  35 ++++++
+ pkg/muxer/tcp/mux_test.go     |  80 ++++++++++++++
+ 4 files changed, 336 insertions(+)
+
+diff --git a/pkg/muxer/tcp/matcher.go b/pkg/muxer/tcp/matcher.go
+index 0b61dc362..36a991f62 100644
+--- a/pkg/muxer/tcp/matcher.go
++++ b/pkg/muxer/tcp/matcher.go
+@@ -12,8 +12,17 @@ import (
+ 	"github.com/traefik/traefik/v3/pkg/muxer"
+ )
+ 
++// Application protocols detected on the decrypted stream by the post-TLS routing stage,
++// and accepted as the AppProtocol matcher value.
++const (
++	AppProtoHTTP1   = "http/1.1"
++	AppProtoH2      = "h2"
++	AppProtoUnknown = "unknown"
++)
++
+ var tcpFuncs = map[string]func(*matchersTree, ...string) error{
+ 	"ALPN":          expect1Parameter(alpn),
++	"AppProtocol":   expect1Parameter(appProtocol),
+ 	"ClientIP":      expect1Parameter(clientIP),
+ 	"HostSNI":       expect1Parameter(hostSNI),
+ 	"HostSNIRegexp": expect1Parameter(hostSNIRegexp),
+@@ -44,6 +53,22 @@ func alpn(tree *matchersTree, protos ...string) error {
+ 	return nil
+ }
+ 
++// appProtocol checks the application protocol sniffed on the decrypted stream,
++// after the TLS handshake completed.
++func appProtocol(tree *matchersTree, protos ...string) error {
++	proto := protos[0]
++
++	if proto != AppProtoHTTP1 && proto != AppProtoH2 && proto != AppProtoUnknown {
++		return fmt.Errorf("invalid value for AppProtocol matcher, %q is not a valid application protocol", proto)
++	}
++
++	tree.matcher = func(meta ConnData) bool {
++		return meta.appProto == proto
++	}
++
++	return nil
++}
++
+ func clientIP(tree *matchersTree, clientIP ...string) error {
+ 	checker, err := ip.NewChecker(clientIP)
+ 	if err != nil {
+diff --git a/pkg/muxer/tcp/matcher_test.go b/pkg/muxer/tcp/matcher_test.go
+index 5ba7d8a1e..61594811b 100644
+--- a/pkg/muxer/tcp/matcher_test.go
++++ b/pkg/muxer/tcp/matcher_test.go
+@@ -383,3 +383,199 @@ func Test_ALPN(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func Test_AppProtocol(t *testing.T) {
++	testCases := []struct {
++		desc     string
++		rule     string
++		expected map[string]bool
++		buildErr bool
++	}{
++		{
++			desc:     "Invalid AppProtocol matcher (empty parameters)",
++			rule:     "AppProtocol(``)",
++			buildErr: true,
++		},
++		{
++			desc:     "Invalid AppProtocol matcher (too many parameters)",
++			rule:     "AppProtocol(`h2`, `http/1.1`)",
++			buildErr: true,
++		},
++		{
++			desc:     "Invalid AppProtocol matcher (unknown protocol)",
++			rule:     "AppProtocol(`mqtt`)",
++			buildErr: true,
++		},
++		{
++			desc:     "Invalid AppProtocol matcher (ALPN protocol not in the value domain)",
++			rule:     "AppProtocol(`acme-tls/1`)",
++			buildErr: true,
++		},
++		{
++			desc:     "Invalid AppProtocol matcher (HTTP/1.0 is not a value)",
++			rule:     "AppProtocol(`http/1.0`)",
++			buildErr: true,
++		},
++		{
++			desc:     "Invalid AppProtocol matcher (values are case-sensitive)",
++			rule:     "AppProtocol(`H2`)",
++			buildErr: true,
++		},
++		{
++			desc: "Valid AppProtocol matcher (h2)",
++			rule: "AppProtocol(`h2`)",
++			expected: map[string]bool{
++				"h2":       true,
++				"http/1.1": false,
++				"unknown":  false,
++				"":         false,
++			},
++		},
++		{
++			desc: "Valid AppProtocol matcher (http/1.1)",
++			rule: "AppProtocol(`http/1.1`)",
++			expected: map[string]bool{
++				"h2":       false,
++				"http/1.1": true,
++				"unknown":  false,
++				"":         false,
++			},
++		},
++		{
++			desc: "Valid AppProtocol matcher (unknown)",
++			rule: "AppProtocol(`unknown`)",
++			expected: map[string]bool{
++				"h2":       false,
++				"http/1.1": false,
++				"unknown":  true,
++				"":         false,
++			},
++		},
++		{
++			desc: "Valid AppProtocol matcher (negated)",
++			rule: "!AppProtocol(`unknown`)",
++			expected: map[string]bool{
++				"h2":       true,
++				"http/1.1": true,
++				"unknown":  false,
++				"":         true,
++			},
++		},
++		{
++			desc: "Valid AppProtocol matcher (lower case matcher name)",
++			rule: "appprotocol(`unknown`)",
++			expected: map[string]bool{
++				"unknown": true,
++				"h2":      false,
++			},
++		},
++	}
++
++	for _, test := range testCases {
++		t.Run(test.desc, func(t *testing.T) {
++			t.Parallel()
++
++			muxer, err := NewMuxer(nil)
++			require.NoError(t, err)
++
++			err = muxer.AddRoute(test.rule, "", 0, "", tcp.HandlerFunc(func(conn tcp.WriteCloser) {}))
++			if test.buildErr {
++				require.Error(t, err)
++				return
++			}
++			require.NoError(t, err)
++
++			for proto, match := range test.expected {
++				handler, _ := muxer.Match(ConnData{appProto: proto})
++				assert.Equal(t, match, handler != nil, proto)
++			}
++		})
++	}
++}
++
++func Test_AppProtocolCombination(t *testing.T) {
++	testCases := []struct {
++		desc  string
++		rule  string
++		meta  ConnData
++		match bool
++	}{
++		{
++			desc: "HostSNI and AppProtocol both match",
++			rule: "HostSNI(`example.com`) && AppProtocol(`unknown`)",
++			meta: ConnData{
++				serverName: "example.com",
++				appProto:   "unknown",
++			},
++			match: true,
++		},
++		{
++			desc: "HostSNI matches but AppProtocol does not",
++			rule: "HostSNI(`example.com`) && AppProtocol(`unknown`)",
++			meta: ConnData{
++				serverName: "example.com",
++				appProto:   "http/1.1",
++			},
++		},
++		{
++			desc: "AppProtocol matches but HostSNI does not",
++			rule: "HostSNI(`example.com`) && AppProtocol(`unknown`)",
++			meta: ConnData{
++				serverName: "example.org",
++				appProto:   "unknown",
++			},
++		},
++		{
++			// The ALPN matcher keeps matching the protocols offered in the ClientHello,
++			// even when combined with AppProtocol.
++			desc: "ALPN and AppProtocol",
++			rule: "ALPN(`h2`) && AppProtocol(`unknown`)",
++			meta: ConnData{
++				alpnProtos: []string{"h2", "http/1.1"},
++				appProto:   "unknown",
++			},
++			match: true,
++		},
++		{
++			desc: "ClientIP and AppProtocol",
++			rule: "ClientIP(`10.0.0.0/8`) && AppProtocol(`h2`)",
++			meta: ConnData{
++				remoteIP: "10.1.2.3",
++				appProto: "h2",
++			},
++			match: true,
++		},
++		{
++			desc: "HostSNIRegexp or AppProtocol",
++			rule: "HostSNIRegexp(`^foo\\..*$`) || AppProtocol(`unknown`)",
++			meta: ConnData{
++				serverName: "bar.example.com",
++				appProto:   "unknown",
++			},
++			match: true,
++		},
++		{
++			desc: "Negated AppProtocol combined with HostSNI",
++			rule: "HostSNI(`example.com`) && !AppProtocol(`http/1.1`)",
++			meta: ConnData{
++				serverName: "example.com",
++				appProto:   "http/1.1",
++			},
++		},
++	}
++
++	for _, test := range testCases {
++		t.Run(test.desc, func(t *testing.T) {
++			t.Parallel()
++
++			muxer, err := NewMuxer(nil)
++			require.NoError(t, err)
++
++			err = muxer.AddRoute(test.rule, "", 0, "", tcp.HandlerFunc(func(conn tcp.WriteCloser) {}))
++			require.NoError(t, err)
++
++			handler, _ := muxer.Match(test.meta)
++			assert.Equal(t, test.match, handler != nil)
++		})
++	}
++}
+diff --git a/pkg/muxer/tcp/mux.go b/pkg/muxer/tcp/mux.go
+index 08436c5bb..8fddcd6d4 100644
+--- a/pkg/muxer/tcp/mux.go
++++ b/pkg/muxer/tcp/mux.go
+@@ -19,6 +19,9 @@ type ConnData struct {
+ 	serverName string
+ 	remoteIP   string
+ 	alpnProtos []string
++	// appProto is the application protocol sniffed from the decrypted stream,
++	// it is only set for the post-TLS routing stage and empty otherwise.
++	appProto string
+ }
+ 
+ // NewConnData builds a connData struct from the given parameters.
+@@ -38,6 +41,15 @@ func NewConnData(serverName string, remoteAddr net.Addr, alpnProtos []string) (C
+ 	}, nil
+ }
+ 
++// WithAppProtocol returns a copy of the ConnData with the given application protocol.
++// The post-TLS routing stage reuses the ClientHello stage ConnData instead of building
++// a new one, so that a given matcher keeps the exact same semantics in both stages:
++// ALPN then still matches the protocols offered by the client, not the negotiated one.
++func (c ConnData) WithAppProtocol(appProto string) ConnData {
++	c.appProto = appProto
++	return c
++}
++
+ // Muxer defines a muxer that handles TCP routing with rules.
+ type Muxer struct {
+ 	routes routes
+@@ -184,6 +196,29 @@ func (m *Muxer) HasRoutes() bool {
+ 	return len(m.routes) > 0
+ }
+ 
++// HasAppProtocolMatcher returns whether the given rule uses the AppProtocol matcher.
++// It relies on the muxer parsers, and not on a dedicated one, so that a rule using
++// AppProtocol with the v2 syntax reports the unknown matcher error instead of being
++// silently accepted.
++func (m *Muxer) HasAppProtocolMatcher(rule, syntax string) (bool, error) {
++	parser := m.parser
++	if syntax == "v2" {
++		parser = m.parserV2
++	}
++
++	parse, err := parser.Parse(rule)
++	if err != nil {
++		return false, fmt.Errorf("error while parsing rule %s: %w", rule, err)
++	}
++
++	buildTree, ok := parse.(rules.TreeBuilder)
++	if !ok {
++		return false, fmt.Errorf("error while parsing rule %s", rule)
++	}
++
++	return len(buildTree().ParseMatchers([]string{"AppProtocol"})) > 0, nil
++}
++
+ // ParseHostSNI extracts the HostSNIs declared in a rule.
+ // This is a first naive implementation used in TCP routing.
+ func ParseHostSNI(rule string) ([]string, error) {
+diff --git a/pkg/muxer/tcp/mux_test.go b/pkg/muxer/tcp/mux_test.go
+index ea1759df3..0420bef9c 100644
+--- a/pkg/muxer/tcp/mux_test.go
++++ b/pkg/muxer/tcp/mux_test.go
+@@ -567,3 +567,83 @@ func (f fakeAddr) String() string {
+ func (f fakeAddr) Network() string {
+ 	panic("Implement me")
+ }
++
++func Test_WithAppProtocol(t *testing.T) {
++	connData, err := NewConnData("Example.com", &net.TCPAddr{IP: net.IPv4(10, 0, 0, 1), Port: 4242}, []string{"h2", "http/1.1"})
++	require.NoError(t, err)
++
++	withAppProto := connData.WithAppProtocol("unknown")
++
++	assert.Equal(t, "unknown", withAppProto.appProto)
++	assert.Equal(t, "example.com", withAppProto.serverName)
++	assert.Equal(t, "10.0.0.1", withAppProto.remoteIP)
++	assert.Equal(t, []string{"h2", "http/1.1"}, withAppProto.alpnProtos)
++
++	// The receiver must not be mutated, a connection is matched against several routes.
++	assert.Empty(t, connData.appProto)
++}
++
++func Test_HasAppProtocolMatcher(t *testing.T) {
++	testCases := []struct {
++		desc      string
++		rule      string
++		syntax    string
++		expected  bool
++		expectErr bool
++	}{
++		{
++			desc:     "No AppProtocol matcher",
++			rule:     "HostSNI(`example.com`)",
++			expected: false,
++		},
++		{
++			desc:     "AppProtocol matcher alone",
++			rule:     "AppProtocol(`unknown`)",
++			expected: true,
++		},
++		{
++			desc:     "AppProtocol matcher combined",
++			rule:     "HostSNI(`example.com`) && AppProtocol(`unknown`)",
++			expected: true,
++		},
++		{
++			desc:     "Negated AppProtocol matcher",
++			rule:     "HostSNI(`example.com`) && !AppProtocol(`http/1.1`)",
++			expected: true,
++		},
++		{
++			desc:     "AppProtocol matcher with an invalid value is still detected",
++			rule:     "AppProtocol(`mqtt`)",
++			expected: true,
++		},
++		{
++			desc:      "AppProtocol matcher is not supported by the v2 syntax",
++			rule:      "AppProtocol(`unknown`)",
++			syntax:    "v2",
++			expectErr: true,
++		},
++		{
++			desc:      "Unparsable rule",
++			rule:      "HostSNI(`example.com`",
++			expectErr: true,
++		},
++	}
++
++	for _, test := range testCases {
++		t.Run(test.desc, func(t *testing.T) {
++			t.Parallel()
++
++			muxer, err := NewMuxer(nil)
++			require.NoError(t, err)
++
++			hasMatcher, err := muxer.HasAppProtocolMatcher(test.rule, test.syntax)
++			if test.expectErr {
++				require.Error(t, err)
++				return
++			}
++			require.NoError(t, err)
++
++			assert.Equal(t, test.expected, hasMatcher)
++		})
++	}
++}

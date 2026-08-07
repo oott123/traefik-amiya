@@ -1,0 +1,236 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: claude <noreply@anthropic.com>
+Date: Fri, 7 Aug 2026 20:52:04 +0800
+Subject: [PATCH] Carry the TLS state and the ClientHello routing data on the
+ peek connection
+
+Assisted-by: Claude Opus 5
+---
+ pkg/server/router/tcp/postgres.go    |   4 +-
+ pkg/server/router/tcp/router.go      | 121 +++++++++++++++++++++++++--
+ pkg/server/router/tcp/router_test.go |   4 +-
+ 3 files changed, 116 insertions(+), 13 deletions(-)
+
+diff --git a/pkg/server/router/tcp/postgres.go b/pkg/server/router/tcp/postgres.go
+index a91e531e6..862be0837 100644
+--- a/pkg/server/router/tcp/postgres.go
++++ b/pkg/server/router/tcp/postgres.go
+@@ -18,7 +18,7 @@ var (
+ )
+ 
+ // isPostgres determines whether the buffer contains the Postgres STARTTLS message.
+-func isPostgres(conn *peekConn) (bool, error) {
++func isPostgres(conn *PeekConn) (bool, error) {
+ 	// Peek the first 8 bytes individually to prevent blocking on peek
+ 	// if the underlying conn does not send enough bytes.
+ 	// It could happen if a protocol start by sending less than 8 bytes,
+@@ -38,7 +38,7 @@ func isPostgres(conn *peekConn) (bool, error) {
+ 
+ // servePostgres serves a connection with a Postgres client negotiating a STARTTLS session.
+ // It handles TCP TLS routing, after accepting to start the STARTTLS session.
+-func (r *Router) servePostgres(conn *peekConn) error {
++func (r *Router) servePostgres(conn *PeekConn) error {
+ 	if _, err := conn.Write(PostgresStartTLSReply); err != nil {
+ 		return fmt.Errorf("writing PostgresStartTLSReply: %w", err)
+ 	}
+diff --git a/pkg/server/router/tcp/router.go b/pkg/server/router/tcp/router.go
+index 19ecd59e0..6337068b2 100644
+--- a/pkg/server/router/tcp/router.go
++++ b/pkg/server/router/tcp/router.go
+@@ -178,6 +178,10 @@ func (r *Router) ServeTCP(conn tcp.WriteCloser) {
+ 		return
+ 	}
+ 
++	// The post-TLS routing stage reuses this data instead of building its own,
++	// so that the matchers keep the exact same semantics in both stages.
++	pConn.connData = &connData
++
+ 	if !hello.isTLS {
+ 		handler, _ := r.muxerTCP.Match(connData)
+ 		switch {
+@@ -355,31 +359,130 @@ func (t *brokenTLSRouter) ServeTCP(conn tcp.WriteCloser) {
+ 	_ = conn.Close()
+ }
+ 
+-// peekConn wraps a tcp.WriteCloser with a bufio.Reader for Peek operations
++// PeekConn wraps a tcp.WriteCloser with a bufio.Reader for Peek operations
+ // and a peeked buffer that accumulates bytes consumed during protocol detection
+ // so they can be replayed on subsequent Read calls.
+-type peekConn struct {
++//
++// It is deliberately embedding the tcp.WriteCloser interface, and not a concrete
++// type: when it wraps a *tls.Conn for the post-TLS routing stage, the ConnectionState
++// method must not be promoted, or net/http would take it for a connectionStater and
++// skip the HTTP/2 preface detection the h2 branch relies on. See TLSStatefulConn.
++type PeekConn struct {
+ 	tcp.WriteCloser
+ 
+ 	peeked []byte
+ 	reader *bufio.Reader
++
++	// tlsState is the state of the completed handshake, only set for the post-TLS
++	// routing stage.
++	tlsState *tls.ConnectionState
++	// connData is the ClientHello stage connection metadata, only set for the
++	// ClientHello routing stage, and read back by the post-TLS stage.
++	connData *tcpmuxer.ConnData
+ }
+ 
+-func newPeekConn(conn tcp.WriteCloser) *peekConn {
+-	return &peekConn{
++func newPeekConn(conn tcp.WriteCloser) *PeekConn {
++	return &PeekConn{
+ 		WriteCloser: conn,
+ 		reader:      bufio.NewReader(conn),
+ 	}
+ }
+ 
++// newTLSPeekConn returns a PeekConn wrapping a connection whose TLS handshake has
++// completed, carrying its state for the post-TLS routing stage.
++func newTLSPeekConn(conn tcp.WriteCloser, state tls.ConnectionState) *PeekConn {
++	pConn := newPeekConn(conn)
++	pConn.tlsState = &state
++
++	return pConn
++}
++
++// TLSState returns the state of the TLS handshake this connection carries.
++//
++// This method must not be named ConnectionState: net/http asserts that name to
++// detect an already-terminated TLS connection, and doing so would disable the
++// unencrypted_http2 preface detection the h2 branch depends on (design §5.3).
++func (c *PeekConn) TLSState() tls.ConnectionState {
++	if c.tlsState == nil {
++		return tls.ConnectionState{}
++	}
++
++	return *c.tlsState
++}
++
++// NetConn returns the connection wrapped by this PeekConn.
++func (c *PeekConn) NetConn() net.Conn {
++	return c.WriteCloser
++}
++
++// clientHelloConnData returns the connection metadata built at the ClientHello stage.
++func (c *PeekConn) clientHelloConnData() (tcpmuxer.ConnData, bool) {
++	if c.connData == nil {
++		return tcpmuxer.ConnData{}, false
++	}
++
++	return *c.connData, true
++}
++
++// connDataCarrier is implemented by the connection wrappers able to hand the
++// ClientHello stage connection metadata over to the post-TLS routing stage.
++// The post-TLS router asserts this interface, and not a concrete type, so that a
++// wrapper layer inserted in between only has to forward the method.
++type connDataCarrier interface {
++	clientHelloConnData() (tcpmuxer.ConnData, bool)
++}
++
++// TLSStatefulConn exposes the TLS handshake state under the name net/http expects,
++// so that it fills Request.TLS itself and serves the connection through its native
++// HTTP/1.x branch, exactly as it would for a connection that was never sniffed.
++//
++// It is only used for connections that negotiated http/1.1 or no ALPN protocol at
++// all: a connection that negotiated h2 must be handed over as a bare PeekConn, or
++// net/http would skip the unencrypted_http2 preface detection (design §5.3).
++type TLSStatefulConn struct {
++	*PeekConn
++}
++
++// ConnectionState returns the state of the TLS handshake this connection carries.
++func (c TLSStatefulConn) ConnectionState() tls.ConnectionState {
++	return c.TLSState()
++}
++
++// AsPeekConn returns the PeekConn underlying the given connection, if any.
++func AsPeekConn(conn net.Conn) (*PeekConn, bool) {
++	switch c := conn.(type) {
++	case *PeekConn:
++		return c, true
++	case TLSStatefulConn:
++		return c.PeekConn, true
++	default:
++		return nil, false
++	}
++}
++
++type tlsConnectionStateKey struct{}
++
++// AddTLSConnectionStateInContext carries the TLS handshake state of a sniffed connection
++// down to the HTTP handlers, which cannot get it from the request: the h2 branch reaches
++// net/http through the unencrypted_http2 path, which does not fill Request.TLS.
++func AddTLSConnectionStateInContext(ctx context.Context, state tls.ConnectionState) context.Context {
++	return context.WithValue(ctx, tlsConnectionStateKey{}, &state)
++}
++
++// GetTLSConnectionState returns the TLS handshake state carried by the given context.
++func GetTLSConnectionState(ctx context.Context) (*tls.ConnectionState, bool) {
++	state, ok := ctx.Value(tlsConnectionStateKey{}).(*tls.ConnectionState)
++	return state, ok
++}
++
+ // Peek allows peeking into the connection without consuming bytes, by using the bufio.Reader's Peek method.
+-func (c *peekConn) Peek(n int) ([]byte, error) {
++func (c *PeekConn) Peek(n int) ([]byte, error) {
+ 	return c.reader.Peek(n)
+ }
+ 
+ // PeekRead reads from the connection and accumulates the read bytes into the peeked buffer, allowing them to be replayed later.
+ // Note that PeekRead advances the reader, thus the next call to Peek will not return the same result as the previous one.
+-func (c *peekConn) PeekRead(p []byte) (int, error) {
++func (c *PeekConn) PeekRead(p []byte) (int, error) {
+ 	n, err := c.reader.Read(p)
+ 	if n > 0 {
+ 		c.peeked = append(c.peeked, p[:n]...)
+@@ -388,7 +491,7 @@ func (c *peekConn) PeekRead(p []byte) (int, error) {
+ }
+ 
+ // Read drains accumulated peeked bytes first, then reads from the bufio reader.
+-func (c *peekConn) Read(p []byte) (int, error) {
++func (c *PeekConn) Read(p []byte) (int, error) {
+ 	if len(c.peeked) > 0 {
+ 		n := copy(p, c.peeked)
+ 		c.peeked = c.peeked[n:]
+@@ -410,7 +513,7 @@ type clientHello struct {
+ // clientHelloInfo returns various data from the clientHello handshake,
+ // without consuming any bytes from conn.
+ // It returns an error if it can't peek the first byte from the connection.
+-func clientHelloInfo(conn *peekConn) (*clientHello, error) {
++func clientHelloInfo(conn *PeekConn) (*clientHello, error) {
+ 	hdr, err := conn.Peek(1)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("peeking first byte: %w", err)
+@@ -459,7 +562,7 @@ func clientHelloInfo(conn *peekConn) (*clientHello, error) {
+ type readOnlyConn struct {
+ 	net.Conn // nil; crash on any unexpected use
+ 
+-	conn *peekConn
++	conn *PeekConn
+ }
+ 
+ // Read reads from the conn using PeekRead to keep the read bytes.
+diff --git a/pkg/server/router/tcp/router_test.go b/pkg/server/router/tcp/router_test.go
+index 221042cd2..9317194b2 100644
+--- a/pkg/server/router/tcp/router_test.go
++++ b/pkg/server/router/tcp/router_test.go
+@@ -763,7 +763,7 @@ func Test_clientHelloInfo_oversizedRecordLength(t *testing.T) {
+ 			resultCh := make(chan result, 1)
+ 
+ 			go func() {
+-				pConn := &peekConn{reader: bufio.NewReader(serverConn)}
++				pConn := &PeekConn{reader: bufio.NewReader(serverConn)}
+ 				hello, err := clientHelloInfo(pConn)
+ 				resultCh <- result{hello, err}
+ 			}()
+@@ -828,7 +828,7 @@ func Test_clientHelloInfo_tlsRecordFragmentation(t *testing.T) {
+ 	resultCh := make(chan result, 1)
+ 
+ 	go func() {
+-		pConn := &peekConn{reader: bufio.NewReader(serverConn)}
++		pConn := &PeekConn{reader: bufio.NewReader(serverConn)}
+ 		hello, err := clientHelloInfo(pConn)
+ 		resultCh <- result{hello, err}
+ 	}()

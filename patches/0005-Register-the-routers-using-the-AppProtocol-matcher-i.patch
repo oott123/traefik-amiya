@@ -1,0 +1,228 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: claude <noreply@anthropic.com>
+Date: Fri, 7 Aug 2026 21:01:29 +0800
+Subject: [PATCH] Register the routers using the AppProtocol matcher in the
+ post-TLS stage
+
+Assisted-by: Claude Opus 5
+---
+ pkg/server/router/tcp/manager.go      |  57 ++++++++++++
+ pkg/server/router/tcp/manager_test.go | 126 ++++++++++++++++++++++++++
+ 2 files changed, 183 insertions(+)
+
+diff --git a/pkg/server/router/tcp/manager.go b/pkg/server/router/tcp/manager.go
+index 9d023e5a1..9e6451623 100644
+--- a/pkg/server/router/tcp/manager.go
++++ b/pkg/server/router/tcp/manager.go
+@@ -255,6 +255,42 @@ func (m *Manager) addTCPHandlers(ctx context.Context, configs map[string]*runtim
+ 			continue
+ 		}
+ 
++		// Routers using the AppProtocol matcher are matched by the second routing
++		// stage, against the decrypted stream, and must therefore not be registered
++		// in any of the ClientHello stage muxers.
++		isPostTLS, err := router.muxerPostTLS.HasAppProtocolMatcher(routerConfig.Rule, routerConfig.RuleSyntax)
++		if err != nil {
++			routerErr := fmt.Errorf("invalid rule: %q , %w", routerConfig.Rule, err)
++			routerConfig.AddError(routerErr, true)
++			logger.Error().Err(routerErr).Send()
++			continue
++		}
++
++		if isPostTLS {
++			if err := checkPostTLSRouter(routerConfig); err != nil {
++				routerConfig.AddError(err, true)
++				logger.Error().Err(err).Send()
++				continue
++			}
++
++			// No tcp.TLSHandler here: TLS is terminated by the HTTPS path the
++			// connection came through, the service gets the plaintext stream.
++			handler, err := m.buildTCPHandler(ctxRouter, routerConfig)
++			if err != nil {
++				routerConfig.AddError(err, true)
++				logger.Error().Err(err).Send()
++				continue
++			}
++
++			logger.Debug().Msgf("Adding post-TLS route for %q", routerConfig.Rule)
++
++			if err := router.AddPostTLSRoute(routerConfig.Rule, routerConfig.RuleSyntax, routerConfig.Priority, providerName(routerName), handler); err != nil {
++				routerConfig.AddError(err, true)
++				logger.Error().Err(err).Send()
++			}
++			continue
++		}
++
+ 		var handler tcp.Handler
+ 		if routerConfig.TLS == nil || routerConfig.TLS.Passthrough {
+ 			handler, err = m.buildTCPHandler(ctxRouter, routerConfig)
+@@ -355,6 +391,27 @@ func (m *Manager) addTCPHandlers(ctx context.Context, configs map[string]*runtim
+ 	}
+ }
+ 
++// checkPostTLSRouter validates the TLS configuration of a router using the
++// AppProtocol matcher.
++func checkPostTLSRouter(routerConfig *runtime.TCPRouterInfo) error {
++	if routerConfig.TLS == nil {
++		return errors.New("AppProtocol matcher requires TLS termination on the router")
++	}
++
++	if routerConfig.TLS.Passthrough {
++		return errors.New("AppProtocol matcher cannot be used with TLS passthrough")
++	}
++
++	// The TLS configuration of such a connection is decided by the HTTPS path it
++	// came through, keyed by SNI. Letting these routers bring their own options
++	// would have them compete for that key and silently override each other.
++	if routerConfig.TLS.Options != "" {
++		return errors.New("TLS options cannot be set on a router using the AppProtocol matcher, they are inherited from the entryPoint HTTPS configuration")
++	}
++
++	return nil
++}
++
+ func (m *Manager) buildTCPHandler(ctx context.Context, router *runtime.TCPRouterInfo) (tcp.Handler, error) {
+ 	var qualifiedNames []string
+ 	for _, name := range router.Middlewares {
+diff --git a/pkg/server/router/tcp/manager_test.go b/pkg/server/router/tcp/manager_test.go
+index 50301b354..a6373a122 100644
+--- a/pkg/server/router/tcp/manager_test.go
++++ b/pkg/server/router/tcp/manager_test.go
+@@ -5,6 +5,7 @@ import (
+ 	"testing"
+ 
+ 	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
+ 	"github.com/traefik/traefik/v3/pkg/config/dynamic"
+ 	"github.com/traefik/traefik/v3/pkg/config/runtime"
+ 	tcpmiddleware "github.com/traefik/traefik/v3/pkg/server/middleware/tcp"
+@@ -397,3 +398,128 @@ func TestRuntimeConfiguration(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func TestPostTLSRouterConfiguration(t *testing.T) {
++	testCases := []struct {
++		desc          string
++		router        *dynamic.TCPRouter
++		expectedError string
++	}{
++		{
++			desc: "Valid post-TLS router",
++			router: &dynamic.TCPRouter{
++				EntryPoints: []string{"websecure"},
++				Service:     "foo-service",
++				Rule:        "HostSNI(`bar.foo`) && AppProtocol(`unknown`)",
++				TLS:         &dynamic.RouterTCPTLSConfig{},
++			},
++		},
++		{
++			desc: "Valid post-TLS router without HostSNI",
++			router: &dynamic.TCPRouter{
++				EntryPoints: []string{"websecure"},
++				Service:     "foo-service",
++				Rule:        "AppProtocol(`unknown`)",
++				TLS:         &dynamic.RouterTCPTLSConfig{},
++			},
++		},
++		{
++			desc: "No TLS on the router",
++			router: &dynamic.TCPRouter{
++				EntryPoints: []string{"websecure"},
++				Service:     "foo-service",
++				Rule:        "AppProtocol(`unknown`)",
++			},
++			expectedError: "AppProtocol matcher requires TLS termination on the router",
++		},
++		{
++			desc: "TLS passthrough",
++			router: &dynamic.TCPRouter{
++				EntryPoints: []string{"websecure"},
++				Service:     "foo-service",
++				Rule:        "HostSNI(`bar.foo`) && AppProtocol(`unknown`)",
++				TLS:         &dynamic.RouterTCPTLSConfig{Passthrough: true},
++			},
++			expectedError: "AppProtocol matcher cannot be used with TLS passthrough",
++		},
++		{
++			desc: "TLS options set on the router",
++			router: &dynamic.TCPRouter{
++				EntryPoints: []string{"websecure"},
++				Service:     "foo-service",
++				Rule:        "HostSNI(`bar.foo`) && AppProtocol(`unknown`)",
++				TLS:         &dynamic.RouterTCPTLSConfig{Options: "foo"},
++			},
++			expectedError: "TLS options cannot be set on a router using the AppProtocol matcher",
++		},
++		{
++			desc: "Invalid AppProtocol value",
++			router: &dynamic.TCPRouter{
++				EntryPoints: []string{"websecure"},
++				Service:     "foo-service",
++				Rule:        "AppProtocol(`mqtt`)",
++				TLS:         &dynamic.RouterTCPTLSConfig{},
++			},
++			expectedError: "is not a valid application protocol",
++		},
++		{
++			desc: "AppProtocol matcher with the v2 rule syntax",
++			router: &dynamic.TCPRouter{
++				EntryPoints: []string{"websecure"},
++				Service:     "foo-service",
++				Rule:        "AppProtocol(`unknown`)",
++				RuleSyntax:  "v2",
++				TLS:         &dynamic.RouterTCPTLSConfig{},
++			},
++			expectedError: "error while parsing rule",
++		},
++	}
++
++	for _, test := range testCases {
++		t.Run(test.desc, func(t *testing.T) {
++			t.Parallel()
++
++			routerInfo := &runtime.TCPRouterInfo{TCPRouter: test.router}
++
++			conf := &runtime.Configuration{
++				TCPServices: map[string]*runtime.TCPServiceInfo{
++					"foo-service": {
++						TCPService: &dynamic.TCPService{
++							LoadBalancer: &dynamic.TCPServersLoadBalancer{
++								Servers: []dynamic.TCPServer{{Address: "127.0.0.1:8085"}},
++							},
++						},
++					},
++				},
++				TCPRouters: map[string]*runtime.TCPRouterInfo{"foo": routerInfo},
++			}
++
++			dialerManager := tcp2.NewDialerManager(nil)
++			dialerManager.Update(map[string]*dynamic.TCPServersTransport{"default@internal": {}})
++
++			tlsManager := traefiktls.NewManager(nil)
++			tlsManager.UpdateConfigs(t.Context(), map[string]traefiktls.Store{},
++				map[string]traefiktls.Options{"default": {}, "foo": {}}, []*traefiktls.CertAndStores{})
++
++			routerManager := NewManager(conf, tcp.NewManager(conf, dialerManager),
++				tcpmiddleware.NewBuilder(conf.TCPMiddlewares), nil, nil, tlsManager, nil)
++
++			router, err := routerManager.buildEntryPointHandler(t.Context(), conf.TCPRouters, nil, nil, nil)
++			require.NoError(t, err)
++
++			if test.expectedError != "" {
++				require.Len(t, routerInfo.Err, 1)
++				assert.Contains(t, routerInfo.Err[0], test.expectedError)
++				assert.False(t, router.muxerPostTLS.HasRoutes())
++				return
++			}
++
++			require.Empty(t, routerInfo.Err)
++			assert.True(t, router.muxerPostTLS.HasRoutes())
++
++			// A post-TLS router must not take part in the ClientHello stage.
++			assert.False(t, router.muxerTCP.HasRoutes())
++			assert.False(t, router.muxerTCPTLS.HasRoutes())
++		})
++	}
++}

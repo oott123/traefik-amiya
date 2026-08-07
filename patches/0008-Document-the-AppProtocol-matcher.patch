@@ -1,0 +1,200 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: claude <noreply@anthropic.com>
+Date: Fri, 7 Aug 2026 21:15:32 +0800
+Subject: [PATCH] Document the AppProtocol matcher
+
+Assisted-by: Claude Opus 5
+---
+ .../tcp/routing/rules-and-priority.md         | 172 ++++++++++++++++++
+ 1 file changed, 172 insertions(+)
+
+diff --git a/docs/content/reference/routing-configuration/tcp/routing/rules-and-priority.md b/docs/content/reference/routing-configuration/tcp/routing/rules-and-priority.md
+index 7f5e0a166..e5f69c223 100644
+--- a/docs/content/reference/routing-configuration/tcp/routing/rules-and-priority.md
++++ b/docs/content/reference/routing-configuration/tcp/routing/rules-and-priority.md
+@@ -22,6 +22,7 @@ The table below lists all the available matchers:
+ | <a id="opt-HostSNIRegexpregexp" href="#opt-HostSNIRegexpregexp" title="#opt-HostSNIRegexpregexp">[```HostSNIRegexp(`regexp`)```](#hostsni-and-hostsniregexp)</a> | Checks if the connection's Server Name Indication matches `regexp`.<br />Use a [Go](https://golang.org/pkg/regexp/) flavored syntax.<br /> More information [here](#hostsni-and-hostsniregexp). |
+ | <a id="opt-ClientIPip" href="#opt-ClientIPip" title="#opt-ClientIPip">[```ClientIP(`ip`)```](#clientip)</a> | Checks if the connection's client IP correspond to `ip`. It accepts IPv4, IPv6 and CIDR formats.<br /> More information [here](#clientip). |
+ | <a id="opt-ALPNprotocol" href="#opt-ALPNprotocol" title="#opt-ALPNprotocol">[```ALPN(`protocol`)```](#alpn)</a> | Checks if the connection's ALPN protocol equals `protocol`.<br /> More information [here](#alpn).          |
++| <a id="opt-AppProtocolprotocol" href="#opt-AppProtocolprotocol" title="#opt-AppProtocolprotocol">[```AppProtocol(`protocol`)```](#appprotocol)</a> | Checks if the application protocol detected on the decrypted stream equals `protocol`.<br /> More information [here](#appprotocol). |
+ 
+ !!! tip "Backticks or Quotes?"
+ 
+@@ -141,6 +142,177 @@ Match connections using the ALPN protocol `h2`:
+ ALPN(`h2`)
+ ```
+ 
++### AppProtocol
++
++The `AppProtocol` matcher allows matching connections on the application protocol
++detected **after** TLS termination, by looking at the first bytes of the decrypted
++stream. It makes it possible to serve a regular HTTPS site on an entryPoint, and to
++send the connections carrying anything else to a TCP service.
++
++Accepted values are `http/1.1`, `h2` and `unknown`. Any other value makes the router
++error out.
++
++A router using this matcher (below, a *post-TLS router*) is subject to the following
++constraints:
++
++| Field            | Requirement                                                          |
++|------------------|----------------------------------------------------------------------|
++| <a id="opt-tls" href="#opt-tls" title="#opt-tls">`tls`</a> | Must be set: the matcher works on the decrypted stream.               |
++| <a id="opt-tls-passthrough" href="#opt-tls-passthrough" title="#opt-tls-passthrough">`tls.passthrough`</a> | Must be `false`.                                                      |
++| <a id="opt-tls-options" href="#opt-tls-options" title="#opt-tls-options">`tls.options`</a> | Must not be set, see the note below.                                  |
++| <a id="opt-Rule-syntax" href="#opt-Rule-syntax" title="#opt-Rule-syntax">Rule syntax</a> | Must be v3 (the default).                                             |
++
++!!! info "TLS configuration"
++
++    The TLS configuration of such a connection is decided by the HTTPS path it went
++    through: the TLS options resolved for the HTTP router with the same SNI, or the
++    entryPoint default ones when there is no such router. Certificates are still
++    picked from the certificate store by SNI, as usual. Setting `tls.options` on a
++    post-TLS router is therefore rejected.
++
++Post-TLS routers only compete with each other, they never take precedence over the
++regular HTTPS traffic of the entryPoint. A connection already claimed at the
++ClientHello stage by a TCP-TLS router (including a passthrough one) never reaches
++this second stage.
++
++#### Detection
++
++The detection branches on the ALPN protocol negotiated during the handshake, because
++that result is binding for the connection — this is exactly what Traefik's HTTP
++server does with a connection that is not sniffed:
++
++- **`h2` negotiated**: `h2` when the payload starts with the 24 bytes
++  `PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n`, `unknown` otherwise.
++- **`http/1.1` or no protocol negotiated**: `http/1.1` when the payload looks like a
++  request line (see below), `unknown` otherwise.
++- **Any other protocol**: not sniffed, always `unknown`.
++
++!!! tip "Make the detection exact"
++
++    On a connection that negotiated `h2`, the payload is `unknown` as soon as it
++    differs from those 24 bytes, which makes the decision exact. Have the fallback
++    client offer `h2` in its ALPN extension to benefit from it. Note that ALPN
++    negotiation is server-order-first and that Traefik offers `["h2", "http/1.1",
++    "acme-tls/1"]`, so a client offering `h2` always ends up negotiating it,
++    whatever its own ordering. As a bonus, this is also what a browser does.
++
++On the `http/1.1` branch, the payload is taken for HTTP when it looks like
++`<token>{1,32} SP <VCHAR>`, which is what Go's HTTP server requires to accept a
++request line. This is deliberately **not** a method allow-list: RFC 9110 defines
++`extension-method` as a bare token, so `QUERY`, the WebDAV methods (`PROPFIND`,
++`PROPPATCH`, `MKCOL`, `COPY`, `MOVE`, `LOCK`, `UNLOCK`), the CalDAV ones (`REPORT`,
++`MKCALENDAR`), and any custom method are all correctly detected as HTTP and never
++sent to the fallback service.
++
++- token characters: ``!#$%&'*+-.^_`|~`` + `0-9` + `A-Z` + `a-z`
++- VCHAR: `0x21`–`0x7E`
++- method name length limit: 32 (the longest IANA-registered method,
++  `UPDATEREDIRECTREF`, is 17 characters)
++
++The guarantee only holds one way: a payload detected as `unknown` is one Traefik's
++HTTP server would have rejected anyway, but a binary payload may well be detected as
++`http/1.1`, in which case the HTTP server answers `400` and closes the connection.
++Check the header bytes of your protocol against the rule above before configuring a
++fallback service.
++
++A connection that does not send enough bytes to be decided on within 500ms (which
++covers a browser opening a connection ahead of time, and any protocol where the
++server speaks first) takes no part in the matching and goes down the regular HTTPS
++path.
++
++!!! warning "Known behavior difference"
++
++    On an entryPoint carrying at least one post-TLS router, a connection that
++    negotiated `h2`, whose payload is not the HTTP/2 preface, and which no post-TLS
++    router matches, is served as HTTP/1.x instead of being closed by the HTTP/2
++    server. This only happens when a client contradicts the ALPN protocol it
++    negotiated itself.
++
++#### Combining with the other matchers
++
++`HostSNI`, `HostSNIRegexp`, `ClientIP` and `ALPN` can all be combined with
++`AppProtocol`, with the exact same semantics they have anywhere else. In particular,
++`ALPN` still matches the protocols **offered** by the client in the ClientHello, not
++the negotiated one.
++
++```yaml
++# The client claims h2, but what it sends is not: hand it to the fallback service.
++HostSNI(`example.com`) && ALPN(`h2`) && AppProtocol(`unknown`)
++```
++
++#### Examples
++
++Serve `example.com` over HTTPS, and send everything else on that connection to an
++internal TCP service:
++
++```yaml tab="Structured (YAML)"
++tcp:
++  routers:
++    camouflage-fallback:
++      entryPoints:
++        - websecure
++      rule: "HostSNI(`example.com`) && AppProtocol(`unknown`)"
++      service: inner-proxy
++      tls: {}
++
++  services:
++    inner-proxy:
++      loadBalancer:
++        servers:
++          - address: "127.0.0.1:10000"
++
++http:
++  routers:
++    site:
++      entryPoints:
++        - websecure
++      rule: "Host(`example.com`)"
++      service: site
++      tls: {}
++```
++
++```toml tab="Structured (TOML)"
++[tcp.routers.camouflage-fallback]
++  entryPoints = ["websecure"]
++  rule = "HostSNI(`example.com`) && AppProtocol(`unknown`)"
++  service = "inner-proxy"
++  [tcp.routers.camouflage-fallback.tls]
++
++[tcp.services.inner-proxy.loadBalancer]
++  [[tcp.services.inner-proxy.loadBalancer.servers]]
++    address = "127.0.0.1:10000"
++
++[http.routers.site]
++  entryPoints = ["websecure"]
++  rule = "Host(`example.com`)"
++  service = "site"
++  [http.routers.site.tls]
++```
++
++```yaml tab="Labels"
++labels:
++  - 'traefik.tcp.routers.camouflage-fallback.rule=HostSNI(`example.com`) && AppProtocol(`unknown`)'
++  - "traefik.tcp.routers.camouflage-fallback.entryPoints=websecure"
++  - "traefik.tcp.routers.camouflage-fallback.service=inner-proxy"
++  - "traefik.tcp.routers.camouflage-fallback.tls=true"
++```
++
++```yaml tab="Kubernetes"
++apiVersion: traefik.io/v1alpha1
++kind: IngressRouteTCP
++metadata:
++  name: camouflage-fallback
++spec:
++  entryPoints:
++    - websecure
++  routes:
++    - match: HostSNI(`example.com`) && AppProtocol(`unknown`)
++      services:
++        - name: inner-proxy
++          port: 10000
++  tls: {}
++```
++
+ ## Priority Calculation
+ 
+ ???+ info "How default priorities are computed"

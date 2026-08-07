@@ -1,0 +1,331 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: claude <noreply@anthropic.com>
+Date: Fri, 7 Aug 2026 21:08:11 +0800
+Subject: [PATCH] Add the AppProtocol fallback integration test
+
+Assisted-by: Claude Opus 5
+---
+ integration/appproto_test.go                  | 162 ++++++++++++++++++
+ .../fixtures/appproto/appproto.test.cert      |  19 ++
+ .../fixtures/appproto/appproto.test.key       |  28 +++
+ .../fixtures/appproto/generate_cert.sh        |   7 +
+ integration/fixtures/appproto/simple.toml     |  49 ++++++
+ integration/resources/compose/appproto.yml    |   9 +
+ 6 files changed, 274 insertions(+)
+ create mode 100644 integration/appproto_test.go
+ create mode 100644 integration/fixtures/appproto/appproto.test.cert
+ create mode 100644 integration/fixtures/appproto/appproto.test.key
+ create mode 100644 integration/fixtures/appproto/generate_cert.sh
+ create mode 100644 integration/fixtures/appproto/simple.toml
+ create mode 100644 integration/resources/compose/appproto.yml
+
+diff --git a/integration/appproto_test.go b/integration/appproto_test.go
+new file mode 100644
+index 000000000..07fd67c03
+--- /dev/null
++++ b/integration/appproto_test.go
+@@ -0,0 +1,162 @@
++package integration
++
++import (
++	"crypto/tls"
++	"fmt"
++	"io"
++	"net/http"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	"github.com/stretchr/testify/suite"
++	"github.com/traefik/traefik/v3/integration/try"
++	"golang.org/x/net/http2"
++)
++
++type AppProtoSuite struct{ BaseSuite }
++
++func TestAppProtoSuite(t *testing.T) {
++	suite.Run(t, new(AppProtoSuite))
++}
++
++func (s *AppProtoSuite) SetupSuite() {
++	s.BaseSuite.SetupSuite()
++
++	s.createComposeProject("appproto")
++	s.composeUp()
++}
++
++func (s *AppProtoSuite) TearDownSuite() {
++	s.BaseSuite.TearDownSuite()
++}
++
++// TestFallback covers an entryPoint serving a regular HTTPS site alongside a TCP
++// router picking up the connections whose decrypted payload is not HTTP.
++func (s *AppProtoSuite) TestFallback() {
++	file := s.adaptFile("fixtures/appproto/simple.toml", struct {
++		Whoami    string
++		WhoamiTCP string
++	}{
++		Whoami:    "http://" + s.getComposeServiceIP("whoami") + ":80",
++		WhoamiTCP: s.getComposeServiceIP("whoami-tcp") + ":8080",
++	})
++
++	s.traefikCmd(withConfigFile(file))
++
++	err := try.GetRequest("http://127.0.0.1:8080/api/rawdata", 5*time.Second,
++		try.StatusCodeIs(http.StatusOK), try.BodyContains("AppProtocol(`unknown`)"))
++	require.NoError(s.T(), err)
++
++	tlsConfig := func(alpnProtos []string) *tls.Config {
++		return &tls.Config{
++			InsecureSkipVerify: true,
++			ServerName:         "appproto.test",
++			NextProtos:         alpnProtos,
++		}
++	}
++
++	s.Run("HTTP/1.1 request is served by the HTTP router", func() {
++		transport := &http.Transport{TLSClientConfig: tlsConfig([]string{"http/1.1"})}
++
++		req, err := http.NewRequest(http.MethodGet, "https://127.0.0.1:8093/", nil)
++		require.NoError(s.T(), err)
++		req.Host = "appproto.test"
++
++		err = try.RequestWithTransport(req, 10*time.Second, transport,
++			try.StatusCodeIs(http.StatusOK), try.BodyContains("X-Forwarded-Proto: https"))
++		require.NoError(s.T(), err)
++	})
++
++	// HTTP/2 goes through the unencrypted_http2 channel once the connection has been
++	// sniffed, and its Request.TLS is restored by Traefik: this is the regression
++	// sentinel for both.
++	s.Run("HTTP/2 request is served by the HTTP router", func() {
++		transport := &http.Transport{TLSClientConfig: tlsConfig([]string{"h2"})}
++		require.NoError(s.T(), http2.ConfigureTransport(transport))
++
++		req, err := http.NewRequest(http.MethodGet, "https://127.0.0.1:8093/", nil)
++		require.NoError(s.T(), err)
++		req.Host = "appproto.test"
++
++		err = try.RequestWithTransport(req, 10*time.Second, transport,
++			try.StatusCodeIs(http.StatusOK),
++			func(res *http.Response) error {
++				if res.ProtoMajor != 2 {
++					return fmt.Errorf("got HTTP/%d, want HTTP/2", res.ProtoMajor)
++				}
++				return nil
++			},
++			try.BodyContains("X-Forwarded-Proto: https"))
++		require.NoError(s.T(), err)
++	})
++
++	// A method the sniffer only accepts because it applies the RFC 9110 token rule
++	// instead of a hardcoded allow-list.
++	s.Run("PROPFIND request is served by the HTTP router", func() {
++		transport := &http.Transport{TLSClientConfig: tlsConfig([]string{"http/1.1"})}
++
++		req, err := http.NewRequest("PROPFIND", "https://127.0.0.1:8093/", nil)
++		require.NoError(s.T(), err)
++		req.Host = "appproto.test"
++
++		err = try.RequestWithTransport(req, 10*time.Second, transport,
++			try.StatusCodeIs(http.StatusOK), try.BodyContains("X-Forwarded-Proto: https"))
++		require.NoError(s.T(), err)
++	})
++
++	for _, alpnProtos := range [][]string{{"http/1.1"}, {"h2"}} {
++		s.Run("Non-HTTP payload with ALPN "+alpnProtos[0]+" reaches the TCP service", func() {
++			out, err := writeAndRead(s.T(), tlsConfig(alpnProtos), "hello\n")
++			require.NoError(s.T(), err)
++			assert.Contains(s.T(), out, "whoami-tcp")
++		})
++	}
++
++	// A client completing the handshake without saying anything cannot be decided
++	// on, and must end up on the regular HTTPS path.
++	s.Run("Silent client is served by the HTTP router", func() {
++		conn, err := tls.Dial("tcp", "127.0.0.1:8093", tlsConfig([]string{"http/1.1"}))
++		require.NoError(s.T(), err)
++		defer conn.Close()
++
++		require.NoError(s.T(), conn.SetDeadline(time.Now().Add(10*time.Second)))
++
++		time.Sleep(600 * time.Millisecond)
++
++		_, err = conn.Write([]byte("GET / HTTP/1.1\r\nHost: appproto.test\r\nConnection: close\r\n\r\n"))
++		require.NoError(s.T(), err)
++
++		out, err := io.ReadAll(conn)
++		require.NoError(s.T(), err)
++		assert.Contains(s.T(), string(out), "X-Forwarded-Proto: https")
++	})
++}
++
++// writeAndRead opens a TLS connection, sends the payload, and returns the answer.
++func writeAndRead(t *testing.T, tlsConfig *tls.Config, payload string) (string, error) {
++	t.Helper()
++
++	conn, err := tls.Dial("tcp", "127.0.0.1:8093", tlsConfig)
++	if err != nil {
++		return "", err
++	}
++	defer conn.Close()
++
++	if err := conn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
++		return "", err
++	}
++
++	if _, err := conn.Write([]byte(payload)); err != nil {
++		return "", err
++	}
++
++	out := make([]byte, 2048)
++	n, err := conn.Read(out)
++	if err != nil {
++		return "", err
++	}
++
++	return string(out[:n]), nil
++}
+diff --git a/integration/fixtures/appproto/appproto.test.cert b/integration/fixtures/appproto/appproto.test.cert
+new file mode 100644
+index 000000000..908d91d70
+--- /dev/null
++++ b/integration/fixtures/appproto/appproto.test.cert
+@@ -0,0 +1,19 @@
++-----BEGIN CERTIFICATE-----
++MIIDKzCCAhOgAwIBAgIUKmclkJwZB4ENdlsrOwv3yLTXPdEwDQYJKoZIhvcNAQEL
++BQAwGDEWMBQGA1UEAwwNYXBwcHJvdG8udGVzdDAeFw0yNjA4MDcxMzA1NDZaFw0z
++NjA4MDQxMzA1NDZaMBgxFjAUBgNVBAMMDWFwcHByb3RvLnRlc3QwggEiMA0GCSqG
++SIb3DQEBAQUAA4IBDwAwggEKAoIBAQCzJR094q+Il0daH5DGhfiDyaKKhpvx0I/k
++JJEA5A6HUhtriz4XBtpeqSP/FaG/q1A/teN3B8FCaUq7t9LokNCnNV2M5s4XwU/G
++Im0qToWOztyqSnZf50pbU8TEkPdqOvjAyzsZUgO1DaTR0LVe0EobkzUfR3kE/hLs
++IFsStzIGQmba6dV74EhrmQ3rlw4CEbm6jMjgXra7omKy5fJV0+xNkYtRKDZRKgZO
++5ktLaGMtTZMxik+Auc4wWsr0Q6MD4II06asdPcUDFnKH1/LdqrK9/kfWWgv9HgEd
++SSi4KCAYDUSKcn1ssIypHmgkijpg56BX/stJ1fOoSCe5Atmj0VdPAgMBAAGjbTBr
++MB0GA1UdDgQWBBQsGFFxyjidi2hR8/g1yzgY8XG+MzAfBgNVHSMEGDAWgBQsGFFx
++yjidi2hR8/g1yzgY8XG+MzAPBgNVHRMBAf8EBTADAQH/MBgGA1UdEQQRMA+CDWFw
++cHByb3RvLnRlc3QwDQYJKoZIhvcNAQELBQADggEBAJmZtMXuYH2XQ19+Qwr0/oe2
++IcIVzrLdVzUPtXCsbWh52bnN67WEes02jqz4YoO2LDooown+1OTPrqyGgdXqVIF8
++3pL/IiDHw39VKnz0lPL0qH8J5+o8EJeozpJdZyMpaQvHtNbtVnoHb/x0fFSOaE2s
++U7nXheY3ZGvEV3dSxbKu8tthdUhM0vhLgp1DIoa7LwCnmSNs73iObtHcaPSbweRm
++mf3uJyD8/HEU2a26o6IBZX9rwJYselTSAWgGRCRex+Tj940/tTG4uv4ZLXgMo5jD
++k2aAxlQMdo6/dajgqwopvq5IV3vn//ShgX7jIEB2nfkVLlpfXi8nzqu8cDB6qu8=
++-----END CERTIFICATE-----
+diff --git a/integration/fixtures/appproto/appproto.test.key b/integration/fixtures/appproto/appproto.test.key
+new file mode 100644
+index 000000000..8ce5a42a1
+--- /dev/null
++++ b/integration/fixtures/appproto/appproto.test.key
+@@ -0,0 +1,28 @@
++-----BEGIN PRIVATE KEY-----
++MIIEvwIBADANBgkqhkiG9w0BAQEFAASCBKkwggSlAgEAAoIBAQCzJR094q+Il0da
++H5DGhfiDyaKKhpvx0I/kJJEA5A6HUhtriz4XBtpeqSP/FaG/q1A/teN3B8FCaUq7
++t9LokNCnNV2M5s4XwU/GIm0qToWOztyqSnZf50pbU8TEkPdqOvjAyzsZUgO1DaTR
++0LVe0EobkzUfR3kE/hLsIFsStzIGQmba6dV74EhrmQ3rlw4CEbm6jMjgXra7omKy
++5fJV0+xNkYtRKDZRKgZO5ktLaGMtTZMxik+Auc4wWsr0Q6MD4II06asdPcUDFnKH
++1/LdqrK9/kfWWgv9HgEdSSi4KCAYDUSKcn1ssIypHmgkijpg56BX/stJ1fOoSCe5
++Atmj0VdPAgMBAAECggEANGAG9xdl24jjBwHQiYIUoK8cUuS9BgtEbl6UeE60wrJq
++KtyIWCIcSO2phQP1iLyU1zOd36iIQ5rWCyDYzD6+igxLoAzAt2hAovxgryxK1vA6
++ypy/lBVig2Xv0spRU6EPJgqk6ie0xsPI6sDarfA2om486zqxsph3vspM5iFiQjq8
++waPTzyUZCq0OY/hpCSj9f9tep2SFsMNZfLm9NiJdOC4RuoqKW83NiPgnJsg6u1/P
++0U0VW1ygIUOzAJx7M6Tg2Xzz88cytuRlUSPoMkvF93kVL/HqXu0R9qUfOX11nf7C
+++fSPzT9AMcS5wI2SbGRscsXIYumLu+xSHIsN6jCUpQKBgQDtqzuTVtaPlOIimZEa
++snOtvQnHa0LfipjYz1SBQLKN2ZBLp9rlGPOBZlU4pdMhDd/aqLzl0/tRSBfoH9BG
++E/sIqn2THHtF+e773TLlXpEujG78EGs0c+sqFzOCCwZksGNOOuXYaxP9TO02g9yh
++KNTzuji4RRjVTeTFwuGjyqnBJQKBgQDA9lQIj1aBESdIZ6aAKqCp1kk/KTCyGtMJ
++V+5hZFbGLC/Fs8ljHlS1yQ8yhs7X3pTOK7Sc7XiH4MLuvlvWThvws3MD9WoWeQeO
++G4+LQlkyfSeUmkZuZtlFPbDwX4J2hGQsGu1jBsSkq53bbTU5edLWoiqV6yWhsnEk
++0vtcFWsuYwKBgQCon87bEMeWg4mWBuK+0FHmuLLRfDasJ8eePCu2sNJ+dhg8tVFH
++LlbGPnbEhFKxpwhmOUYcwjQTTVU46il5Lv/y/BOwZorH8TYwGJbdyiSzpAuyZ2vI
++gV4eNOvknjHhCozKmlstG3vJQeUjwpas+S1t53gKtWuTG3rvHP++mDGsyQKBgQCA
++Ez+FivYkpqkHMtzdlu2arMNjK8jJfmpyei2b8QhzcqKmu4VAx8H8Ap6Wr8mcmHz2
++NyYjPq9QqMtZwXmdTazX35PIndyzW9O66+ojyX8AtvdNd/SllJhDkAXgFdS3K3p9
++l8XWg4iDr/EP0nWQV56snWhcp34LzC+y/GKgJQtF9wKBgQCvYcLW0Mt05DzZitZb
++y5CxzRPrsdpGeK0667AVb/rRVPkbgvClA95UfZ4oxGdlGavuNRxD4h7DaTubN766
++s7E7TCr/jvRLpvh2LO2zVoHgZsZOaGB/jnQJJBgGwNnZliryYIAvViVAkj5PZvuc
++H4BnqC07rDrmWz4gacc2InIYmg==
++-----END PRIVATE KEY-----
+diff --git a/integration/fixtures/appproto/generate_cert.sh b/integration/fixtures/appproto/generate_cert.sh
+new file mode 100644
+index 000000000..60dfa145f
+--- /dev/null
++++ b/integration/fixtures/appproto/generate_cert.sh
+@@ -0,0 +1,7 @@
++openssl req -newkey rsa:2048 \
++  -new -nodes -x509 \
++  -days 3650 \
++  -out appproto.test.cert \
++  -keyout appproto.test.key \
++  -subj "/CN=appproto.test" \
++  -addext "subjectAltName = DNS:appproto.test"
+diff --git a/integration/fixtures/appproto/simple.toml b/integration/fixtures/appproto/simple.toml
+new file mode 100644
+index 000000000..77d40c57d
+--- /dev/null
++++ b/integration/fixtures/appproto/simple.toml
+@@ -0,0 +1,49 @@
++[global]
++  checkNewVersion = false
++  sendAnonymousUsage = false
++
++[log]
++  level = "DEBUG"
++  noColor = true
++
++[entryPoints]
++  [entryPoints.websecure]
++    address = ":8093"
++
++[api]
++  insecure = true
++
++[providers.file]
++  filename = "{{ .SelfFilename }}"
++
++## dynamic configuration ##
++
++[http]
++  [http.routers]
++    [http.routers.whoami]
++      entryPoints = ["websecure"]
++      rule = "Host(`appproto.test`)"
++      service = "whoami"
++      [http.routers.whoami.tls]
++
++  [http.services]
++    [http.services.whoami.loadBalancer]
++      [[http.services.whoami.loadBalancer.servers]]
++        url = "{{ .Whoami }}"
++
++[tcp]
++  [tcp.routers]
++    [tcp.routers.fallback]
++      entryPoints = ["websecure"]
++      rule = "HostSNI(`appproto.test`) && AppProtocol(`unknown`)"
++      service = "whoami-tcp"
++      [tcp.routers.fallback.tls]
++
++  [tcp.services]
++    [tcp.services.whoami-tcp.loadBalancer]
++      [[tcp.services.whoami-tcp.loadBalancer.servers]]
++        address = "{{ .WhoamiTCP }}"
++
++[[tls.certificates]]
++  certFile = "fixtures/appproto/appproto.test.cert"
++  keyFile = "fixtures/appproto/appproto.test.key"
+diff --git a/integration/resources/compose/appproto.yml b/integration/resources/compose/appproto.yml
+new file mode 100644
+index 000000000..63d8e9106
+--- /dev/null
++++ b/integration/resources/compose/appproto.yml
+@@ -0,0 +1,9 @@
++services:
++  whoami:
++    image: traefik/whoami:v1.12.0
++
++  whoami-tcp:
++    image: traefik/whoamitcp
++    command:
++      - -name
++      - whoami-tcp

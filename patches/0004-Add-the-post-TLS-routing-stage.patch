@@ -1,0 +1,655 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: claude <noreply@anthropic.com>
+Date: Fri, 7 Aug 2026 20:59:43 +0800
+Subject: [PATCH] Add the post-TLS routing stage
+
+Assisted-by: Claude Opus 5
+---
+ pkg/server/router/tcp/router.go      | 219 +++++++++++++++---
+ pkg/server/router/tcp/router_test.go | 324 ++++++++++++++++++++++++++-
+ pkg/server/server_entrypoint_tcp.go  |   6 +-
+ 3 files changed, 513 insertions(+), 36 deletions(-)
+
+diff --git a/pkg/server/router/tcp/router.go b/pkg/server/router/tcp/router.go
+index 6337068b2..e45ba1835 100644
+--- a/pkg/server/router/tcp/router.go
++++ b/pkg/server/router/tcp/router.go
+@@ -37,6 +37,13 @@ type Router struct {
+ 	muxerTCPTLS tcpmuxer.Muxer
+ 	// Contains HTTPS routes.
+ 	muxerHTTPS tcpmuxer.Muxer
++	// Contains the post-TLS routes, matched against the decrypted stream once the
++	// handshake completed.
++	muxerPostTLS tcpmuxer.Muxer
++
++	// tlsHandshakeTimeout bounds the handshake the post-TLS routing stage performs
++	// in place of net/http.
++	tlsHandshakeTimeout time.Duration
+ 
+ 	// Forwarder handlers.
+ 	// httpForwarder handles all HTTP requests.
+@@ -73,10 +80,16 @@ func NewRouter(providersPrecedence []string) (*Router, error) {
+ 		return nil, err
+ 	}
+ 
++	muxPostTLS, err := tcpmuxer.NewMuxer(providersPrecedence)
++	if err != nil {
++		return nil, err
++	}
++
+ 	return &Router{
+-		muxerTCP:    *muxTCP,
+-		muxerTCPTLS: *muxTCPTLS,
+-		muxerHTTPS:  *muxHTTPS,
++		muxerTCP:     *muxTCP,
++		muxerTCPTLS:  *muxTCPTLS,
++		muxerHTTPS:   *muxHTTPS,
++		muxerPostTLS: *muxPostTLS,
+ 	}, nil
+ }
+ 
+@@ -250,6 +263,14 @@ func (r *Router) AddTCPRoute(rule string, priority int, providerName string, tar
+ 	return r.muxerTCP.AddRoute(rule, "", priority, providerName, target)
+ }
+ 
++// AddPostTLSRoute defines a handler for the given rule, to be matched against the
++// decrypted stream once the TLS handshake completed.
++// The target gets the plaintext connection, TLS termination is handled by the HTTPS
++// path the connection went through.
++func (r *Router) AddPostTLSRoute(rule, syntax string, priority int, providerName string, target tcp.Handler) error {
++	return r.muxerPostTLS.AddRoute(rule, syntax, priority, providerName, target)
++}
++
+ // AddHTTPTLSConfig defines a handler for a given sniHost and sets the matching tlsConfig.
+ func (r *Router) AddHTTPTLSConfig(sniHost string, config *tls.Config, optionsName string) {
+ 	if r.hostHTTPTLSConfig == nil {
+@@ -280,7 +301,16 @@ func (r *Router) SetHTTPForwarder(handler tcp.Handler) {
+ // SetHTTPSForwarder sets the tcp handler that will forward the TLS connections to an HTTP handler.
+ // It also sets up each TLS handler (with its TLS config) for each Host(SNI) rule we previously kept track of.
+ // It sets up a special handler that closes the connection if a TLS config is nil.
+-func (r *Router) SetHTTPSForwarder(handler tcp.Handler) {
++// When the entryPoint holds post-TLS routes, the forwarder is wrapped in the second
++// routing stage, which is therefore woven into every per-SNI TLS handler as well as
++// into the catchAll HTTPS forwarder.
++func (r *Router) SetHTTPSForwarder(handler tcp.Handler, tlsHandshakeTimeout time.Duration) {
++	r.tlsHandshakeTimeout = tlsHandshakeTimeout
++
++	if r.muxerPostTLS.HasRoutes() {
++		handler = &postTLSRouter{router: r, next: handler}
++	}
++
+ 	for sniHost, tlsConf := range r.hostHTTPTLSConfig {
+ 		var tcpHandler tcp.Handler
+ 		if tlsConf.cfg == nil {
+@@ -359,6 +389,129 @@ func (t *brokenTLSRouter) ServeTCP(conn tcp.WriteCloser) {
+ 	_ = conn.Close()
+ }
+ 
++// postTLSRouter is the second routing stage: it performs the TLS handshake that
++// net/http would otherwise perform lazily, sniffs the application protocol of the
++// decrypted stream, and matches it against the post-TLS routes. Connections that do
++// not match keep going down the regular HTTPS path.
++type postTLSRouter struct {
++	router *Router
++	// next is the HTTPS forwarder handling the connections that did not match.
++	next tcp.Handler
++}
++
++// ServeTCP handshakes, sniffs, and routes the decrypted connection.
++func (p *postTLSRouter) ServeTCP(conn tcp.WriteCloser) {
++	tlsConn, ok := conn.(*tls.Conn)
++	if !ok {
++		// The post-TLS router is only ever woven behind a tcp.TLSHandler.
++		log.Error().Msg("Post-TLS router got a connection which is not a TLS connection")
++		_ = conn.Close()
++		return
++	}
++
++	clientHelloConnData, ok := clientHelloConnDataOf(tlsConn)
++	if !ok {
++		// Losing the ClientHello data would silently degrade every matcher combined
++		// with AppProtocol, so this is treated as a broken invariant.
++		log.Error().Msg("Post-TLS router could not retrieve the ClientHello connection data")
++		_ = conn.Close()
++		return
++	}
++
++	if p.router.tlsHandshakeTimeout > 0 {
++		if err := tlsConn.SetDeadline(time.Now().Add(p.router.tlsHandshakeTimeout)); err != nil {
++			log.Error().Err(err).Msg("Error while setting deadline")
++		}
++	}
++
++	if err := tlsConn.HandshakeContext(context.Background()); err != nil {
++		logDebugOnConnError(err, "Error during TLS handshake")
++		_ = conn.Close()
++		return
++	}
++
++	state := tlsConn.ConnectionState()
++	pConn := newTLSPeekConn(tlsConn, state)
++
++	if err := tlsConn.SetDeadline(time.Now().Add(appProtoSniffTimeout)); err != nil {
++		log.Error().Err(err).Msg("Error while setting deadline")
++	}
++
++	appProto, sniffErr := sniffAppProtocol(pConn, state.NegotiatedProtocol)
++
++	// The deadlines were only there to bound the handshake and the sniffing,
++	// serving the connection is up to the downstream handler from now on.
++	if err := tlsConn.SetDeadline(time.Time{}); err != nil {
++		log.Error().Err(err).Msg("Error while setting deadline")
++	}
++
++	if sniffErr != nil {
++		// No conclusion could be reached, which notably covers a client that
++		// completed the handshake without sending anything, so the connection goes
++		// down the regular HTTPS path without taking part in the second stage.
++		logDebugOnConnError(sniffErr, "Error while sniffing the application protocol")
++		p.serveNext(pConn, state)
++		return
++	}
++
++	handler, _ := p.router.muxerPostTLS.Match(clientHelloConnData.WithAppProtocol(appProto))
++	if handler == nil {
++		p.serveNext(pConn, state)
++		return
++	}
++
++	log.Debug().
++		Str("appProtocol", appProto).
++		Str("serverName", state.ServerName).
++		Str("remoteAddr", pConn.RemoteAddr().String()).
++		Msg("Matched post-TLS route")
++
++	handler.ServeTCP(pConn)
++}
++
++// serveNext hands the connection over to the HTTPS forwarder.
++//
++// The wrapper type is what decides how net/http serves the connection, and it has
++// to mirror what the negotiated protocol would have led to on an unsniffed
++// connection: a bare PeekConn hides the TLS state, which sends the h2 connections
++// through the unencrypted_http2 channel and its preface detection, while
++// TLSStatefulConn exposes it, which sends the others through the native HTTP/1.x
++// branch with Request.TLS already filled in.
++func (p *postTLSRouter) serveNext(conn *PeekConn, state tls.ConnectionState) {
++	if state.NegotiatedProtocol == AppProtoH2 {
++		p.next.ServeTCP(conn)
++		return
++	}
++
++	p.next.ServeTCP(TLSStatefulConn{PeekConn: conn})
++}
++
++// clientHelloConnDataOf unwraps the ClientHello stage connection metadata from a
++// connection the HTTPS path terminated. The tcp.TLSHandler is the only wrapping
++// layer between the two stages.
++func clientHelloConnDataOf(tlsConn *tls.Conn) (tcpmuxer.ConnData, bool) {
++	tlsConnWithOptionsName, ok := tlsConn.NetConn().(tcp.TLSConn)
++	if !ok {
++		return tcpmuxer.ConnData{}, false
++	}
++
++	carrier, ok := tlsConnWithOptionsName.WriteCloser.(connDataCarrier)
++	if !ok {
++		return tcpmuxer.ConnData{}, false
++	}
++
++	return carrier.clientHelloConnData()
++}
++
++// logDebugOnConnError logs a connection error at debug level, unless it is one of
++// the ones a public entryPoint gets all the time and which would only be noise.
++func logDebugOnConnError(err error, msg string) {
++	opErr, ok := errors.AsType[*net.OpError](err)
++	if !errors.Is(err, io.EOF) && (!ok || !opErr.Timeout()) {
++		log.Debug().Err(err).Msg(msg)
++	}
++}
++
+ // PeekConn wraps a tcp.WriteCloser with a bufio.Reader for Peek operations
+ // and a peeked buffer that accumulates bytes consumed during protocol detection
+ // so they can be replayed on subsequent Read calls.
+@@ -397,6 +550,35 @@ func newTLSPeekConn(conn tcp.WriteCloser, state tls.ConnectionState) *PeekConn {
+ 	return pConn
+ }
+ 
++// Peek allows peeking into the connection without consuming bytes, by using the bufio.Reader's Peek method.
++func (c *PeekConn) Peek(n int) ([]byte, error) {
++	return c.reader.Peek(n)
++}
++
++// PeekRead reads from the connection and accumulates the read bytes into the peeked buffer, allowing them to be replayed later.
++// Note that PeekRead advances the reader, thus the next call to Peek will not return the same result as the previous one.
++func (c *PeekConn) PeekRead(p []byte) (int, error) {
++	n, err := c.reader.Read(p)
++	if n > 0 {
++		c.peeked = append(c.peeked, p[:n]...)
++	}
++	return n, err
++}
++
++// Read drains accumulated peeked bytes first, then reads from the bufio reader.
++func (c *PeekConn) Read(p []byte) (int, error) {
++	if len(c.peeked) > 0 {
++		n := copy(p, c.peeked)
++		c.peeked = c.peeked[n:]
++		if len(c.peeked) == 0 {
++			c.peeked = nil
++		}
++		return n, nil
++	}
++
++	return c.reader.Read(p)
++}
++
+ // TLSState returns the state of the TLS handshake this connection carries.
+ //
+ // This method must not be named ConnectionState: net/http asserts that name to
+@@ -475,35 +657,6 @@ func GetTLSConnectionState(ctx context.Context) (*tls.ConnectionState, bool) {
+ 	return state, ok
+ }
+ 
+-// Peek allows peeking into the connection without consuming bytes, by using the bufio.Reader's Peek method.
+-func (c *PeekConn) Peek(n int) ([]byte, error) {
+-	return c.reader.Peek(n)
+-}
+-
+-// PeekRead reads from the connection and accumulates the read bytes into the peeked buffer, allowing them to be replayed later.
+-// Note that PeekRead advances the reader, thus the next call to Peek will not return the same result as the previous one.
+-func (c *PeekConn) PeekRead(p []byte) (int, error) {
+-	n, err := c.reader.Read(p)
+-	if n > 0 {
+-		c.peeked = append(c.peeked, p[:n]...)
+-	}
+-	return n, err
+-}
+-
+-// Read drains accumulated peeked bytes first, then reads from the bufio reader.
+-func (c *PeekConn) Read(p []byte) (int, error) {
+-	if len(c.peeked) > 0 {
+-		n := copy(p, c.peeked)
+-		c.peeked = c.peeked[n:]
+-		if len(c.peeked) == 0 {
+-			c.peeked = nil
+-		}
+-		return n, nil
+-	}
+-
+-	return c.reader.Read(p)
+-}
+-
+ type clientHello struct {
+ 	serverName string   // SNI server name
+ 	protos     []string // ALPN protocols list
+diff --git a/pkg/server/router/tcp/router_test.go b/pkg/server/router/tcp/router_test.go
+index 9317194b2..e8928b39c 100644
+--- a/pkg/server/router/tcp/router_test.go
++++ b/pkg/server/router/tcp/router_test.go
+@@ -20,6 +20,7 @@ import (
+ 	"github.com/stretchr/testify/require"
+ 	"github.com/traefik/traefik/v3/pkg/config/dynamic"
+ 	"github.com/traefik/traefik/v3/pkg/config/runtime"
++	tcpmuxer "github.com/traefik/traefik/v3/pkg/muxer/tcp"
+ 	tcpmiddleware "github.com/traefik/traefik/v3/pkg/server/middleware/tcp"
+ 	"github.com/traefik/traefik/v3/pkg/server/service/tcp"
+ 	traefiktcp "github.com/traefik/traefik/v3/pkg/tcp"
+@@ -617,7 +618,7 @@ func Test_Routing(t *testing.T) {
+ 			}()
+ 
+ 			// The HTTPS forwarder will be added as tcp.TLSHandler (to handle TLS).
+-			router.SetHTTPSForwarder(httpsForwarder)
++			router.SetHTTPSForwarder(httpsForwarder, 0)
+ 
+ 			stoppedTCP := make(chan struct{})
+ 			go func() {
+@@ -1389,3 +1390,324 @@ func (h *httpForwarder) Accept() (net.Conn, error) {
+ 		return nil, err
+ 	}
+ }
++
++type postTLSTestRoute struct {
++	rule string
++	tag  string
++}
++
++// newPostTLSTestRouter starts a TCP router with the given post-TLS routes and returns
++// its address. A matching route answers with its tag, and the HTTPS forwarder answers
++// with the wrapper type it got, which is what decides how net/http serves the
++// connection.
++func newPostTLSTestRouter(t *testing.T, serverALPNProtos []string, routes ...postTLSTestRoute) string {
++	t.Helper()
++
++	certPEM, keyPEM, err := generate.KeyPair("test.localhost", time.Time{})
++	require.NoError(t, err)
++
++	cert, err := tls.X509KeyPair(certPEM, keyPEM)
++	require.NoError(t, err)
++
++	router, err := NewRouter(nil)
++	require.NoError(t, err)
++
++	router.httpsTLSConfig = &tls.Config{
++		Certificates: []tls.Certificate{cert},
++		NextProtos:   serverALPNProtos,
++	}
++
++	for _, route := range routes {
++		tag := route.tag
++		err = router.AddPostTLSRoute(route.rule, "", 0, "", traefiktcp.HandlerFunc(func(conn traefiktcp.WriteCloser) {
++			_, _ = conn.Write([]byte(tag))
++			_ = conn.Close()
++		}))
++		require.NoError(t, err)
++	}
++
++	router.SetHTTPSForwarder(traefiktcp.HandlerFunc(func(conn traefiktcp.WriteCloser) {
++		kind := "bare"
++		if _, ok := conn.(TLSStatefulConn); ok {
++			kind = "stateful"
++		}
++
++		_, _ = conn.Write([]byte("next:" + kind))
++		_ = conn.Close()
++	}), 0)
++
++	ln, err := net.Listen("tcp", "127.0.0.1:0")
++	require.NoError(t, err)
++	t.Cleanup(func() { _ = ln.Close() })
++
++	go func() {
++		for {
++			conn, err := ln.Accept()
++			if err != nil {
++				return
++			}
++
++			go router.ServeTCP(conn.(*net.TCPConn))
++		}
++	}()
++
++	return ln.Addr().String()
++}
++
++// dialPostTLS opens a TLS connection, sends the payload after waiting for the given
++// delay, and returns everything the server sent back.
++func dialPostTLS(t *testing.T, addr string, clientALPNProtos []string, payload string, delay time.Duration) string {
++	t.Helper()
++
++	conn, err := tls.Dial("tcp", addr, &tls.Config{
++		ServerName:         "test.localhost",
++		InsecureSkipVerify: true,
++		NextProtos:         clientALPNProtos,
++	})
++	require.NoError(t, err)
++	t.Cleanup(func() { _ = conn.Close() })
++
++	require.NoError(t, conn.SetDeadline(time.Now().Add(5*time.Second+delay)))
++
++	if delay > 0 {
++		time.Sleep(delay)
++	}
++
++	if payload != "" {
++		_, err = conn.Write([]byte(payload))
++		require.NoError(t, err)
++	}
++
++	got, err := io.ReadAll(conn)
++	require.NoError(t, err)
++
++	return string(got)
++}
++
++func Test_PostTLSRouting(t *testing.T) {
++	const fallbackRule = "HostSNI(`test.localhost`) && AppProtocol(`unknown`)"
++
++	testCases := []struct {
++		desc             string
++		serverALPNProtos []string
++		clientALPNProtos []string
++		rule             string
++		payload          string
++		delay            time.Duration
++		expected         string
++	}{
++		{
++			desc:             "HTTP/1.1 payload keeps going down the HTTPS path",
++			serverALPNProtos: []string{"h2", "http/1.1"},
++			clientALPNProtos: []string{"http/1.1"},
++			rule:             fallbackRule,
++			payload:          "GET / HTTP/1.1\r\nHost: test.localhost\r\n\r\n",
++			expected:         "next:stateful",
++		},
++		{
++			desc:             "Non-HTTP payload reaches the fallback service",
++			serverALPNProtos: []string{"h2", "http/1.1"},
++			clientALPNProtos: []string{"http/1.1"},
++			rule:             fallbackRule,
++			payload:          "\x05\x01\x00some binary payload",
++			expected:         "fallback",
++		},
++		{
++			desc:             "HTTP/2 preface on an h2 connection keeps going down the HTTPS path",
++			serverALPNProtos: []string{"h2", "http/1.1"},
++			clientALPNProtos: []string{"h2"},
++			rule:             fallbackRule,
++			payload:          string(http2Preface) + "\x00\x00\x00\x04\x00\x00\x00\x00\x00",
++			expected:         "next:bare",
++		},
++		{
++			desc:             "HTTP/1.1 payload on an h2 connection reaches the fallback service",
++			serverALPNProtos: []string{"h2", "http/1.1"},
++			clientALPNProtos: []string{"h2"},
++			rule:             fallbackRule,
++			payload:          "GET / HTTP/1.1\r\nHost: test.localhost\r\n\r\n",
++			expected:         "fallback",
++		},
++		{
++			desc:             "Non-HTTP payload on an h2 connection reaches the fallback service",
++			serverALPNProtos: []string{"h2", "http/1.1"},
++			clientALPNProtos: []string{"h2"},
++			rule:             fallbackRule,
++			payload:          "\x05\x01\x00some binary payload",
++			expected:         "fallback",
++		},
++		{
++			desc:             "A connection saying nothing keeps going down the HTTPS path",
++			serverALPNProtos: []string{"h2", "http/1.1"},
++			clientALPNProtos: []string{"http/1.1"},
++			rule:             fallbackRule,
++			delay:            appProtoSniffTimeout + 200*time.Millisecond,
++			payload:          "GET / HTTP/1.1\r\nHost: test.localhost\r\n\r\n",
++			expected:         "next:stateful",
++		},
++		{
++			desc:             "A non-matching HostSNI keeps going down the HTTPS path",
++			serverALPNProtos: []string{"h2", "http/1.1"},
++			clientALPNProtos: []string{"http/1.1"},
++			rule:             "HostSNI(`other.localhost`) && AppProtocol(`unknown`)",
++			payload:          "\x05\x01\x00some binary payload",
++			expected:         "next:stateful",
++		},
++		{
++			desc:             "AppProtocol(`http/1.1`) matches an HTTP payload",
++			serverALPNProtos: []string{"h2", "http/1.1"},
++			clientALPNProtos: []string{"http/1.1"},
++			rule:             "AppProtocol(`http/1.1`)",
++			payload:          "PROPFIND /dav HTTP/1.1\r\nHost: test.localhost\r\n\r\n",
++			expected:         "fallback",
++		},
++		{
++			desc:             "AppProtocol(`h2`) matches a preface",
++			serverALPNProtos: []string{"h2", "http/1.1"},
++			clientALPNProtos: []string{"h2"},
++			rule:             "AppProtocol(`h2`)",
++			payload:          string(http2Preface),
++			expected:         "fallback",
++		},
++		{
++			// The ALPN matcher matches the protocols offered in the ClientHello, not
++			// the negotiated one, in the post-TLS stage as anywhere else. The server
++			// only offering http/1.1 is what makes the two differ: negotiation is
++			// server-order-first, so a client offering h2 against the default Traefik
++			// list would always end up negotiating h2.
++			desc:             "The ALPN matcher still matches the offered protocols",
++			serverALPNProtos: []string{"http/1.1"},
++			clientALPNProtos: []string{"h2", "http/1.1"},
++			rule:             "ALPN(`h2`) && AppProtocol(`unknown`)",
++			payload:          "\x05\x01\x00some binary payload",
++			expected:         "fallback",
++		},
++		{
++			desc:             "The ALPN matcher does not match a protocol which was not offered",
++			serverALPNProtos: []string{"http/1.1"},
++			clientALPNProtos: []string{"http/1.1"},
++			rule:             "ALPN(`h2`) && AppProtocol(`unknown`)",
++			payload:          "\x05\x01\x00some binary payload",
++			expected:         "next:stateful",
++		},
++	}
++
++	for _, test := range testCases {
++		t.Run(test.desc, func(t *testing.T) {
++			t.Parallel()
++
++			addr := newPostTLSTestRouter(t, test.serverALPNProtos, postTLSTestRoute{rule: test.rule, tag: "fallback"})
++
++			assert.Equal(t, test.expected, dialPostTLS(t, addr, test.clientALPNProtos, test.payload, test.delay))
++		})
++	}
++}
++
++// Test_PostTLSRouting_replay checks that the bytes consumed while sniffing are
++// handed over to the fallback service.
++func Test_PostTLSRouting_replay(t *testing.T) {
++	certPEM, keyPEM, err := generate.KeyPair("test.localhost", time.Time{})
++	require.NoError(t, err)
++
++	cert, err := tls.X509KeyPair(certPEM, keyPEM)
++	require.NoError(t, err)
++
++	router, err := NewRouter(nil)
++	require.NoError(t, err)
++
++	router.httpsTLSConfig = &tls.Config{
++		Certificates: []tls.Certificate{cert},
++		NextProtos:   []string{"h2", "http/1.1"},
++	}
++
++	payload := "\x05\x01\x00some binary payload"
++
++	err = router.AddPostTLSRoute("AppProtocol(`unknown`)", "", 0, "", traefiktcp.HandlerFunc(func(conn traefiktcp.WriteCloser) {
++		got := make([]byte, len(payload))
++		_, err := io.ReadFull(conn, got)
++		assert.NoError(t, err)
++		_, _ = conn.Write(got)
++		_ = conn.Close()
++	}))
++	require.NoError(t, err)
++
++	router.SetHTTPSForwarder(traefiktcp.HandlerFunc(func(conn traefiktcp.WriteCloser) {
++		_ = conn.Close()
++	}), 0)
++
++	ln, err := net.Listen("tcp", "127.0.0.1:0")
++	require.NoError(t, err)
++	t.Cleanup(func() { _ = ln.Close() })
++
++	go func() {
++		conn, err := ln.Accept()
++		if err != nil {
++			return
++		}
++
++		router.ServeTCP(conn.(*net.TCPConn))
++	}()
++
++	assert.Equal(t, payload, dialPostTLS(t, ln.Addr().String(), []string{"http/1.1"}, payload, 0))
++}
++
++// Test_SetHTTPSForwarder_noPostTLSRoute checks that an entryPoint without post-TLS
++// route keeps the exact same handler chain as before.
++func Test_SetHTTPSForwarder_noPostTLSRoute(t *testing.T) {
++	router, err := NewRouter(nil)
++	require.NoError(t, err)
++
++	router.httpsTLSConfig = &tls.Config{}
++	router.AddHTTPTLSConfig("test.localhost", &tls.Config{}, "default")
++
++	forwarder := traefiktcp.HandlerFunc(func(conn traefiktcp.WriteCloser) {})
++	router.SetHTTPSForwarder(forwarder, 0)
++
++	httpsForwarder, ok := router.httpsForwarder.(*traefiktcp.TLSHandler)
++	require.True(t, ok)
++	_, isPostTLS := httpsForwarder.Next.(*postTLSRouter)
++	assert.False(t, isPostTLS)
++
++	handler, _ := router.muxerHTTPS.Match(mustConnData(t, "test.localhost"))
++	tlsHandler, ok := handler.(*traefiktcp.TLSHandler)
++	require.True(t, ok)
++	_, isPostTLS = tlsHandler.Next.(*postTLSRouter)
++	assert.False(t, isPostTLS)
++}
++
++// Test_SetHTTPSForwarder_withPostTLSRoute checks that the second routing stage is
++// woven into every TLS handler of the entryPoint, and not only into the catchAll one.
++func Test_SetHTTPSForwarder_withPostTLSRoute(t *testing.T) {
++	router, err := NewRouter(nil)
++	require.NoError(t, err)
++
++	router.httpsTLSConfig = &tls.Config{}
++	router.AddHTTPTLSConfig("test.localhost", &tls.Config{}, "default")
++
++	err = router.AddPostTLSRoute("AppProtocol(`unknown`)", "", 0, "", traefiktcp.HandlerFunc(func(conn traefiktcp.WriteCloser) {}))
++	require.NoError(t, err)
++
++	router.SetHTTPSForwarder(traefiktcp.HandlerFunc(func(conn traefiktcp.WriteCloser) {}), 42*time.Second)
++
++	assert.Equal(t, 42*time.Second, router.tlsHandshakeTimeout)
++
++	httpsForwarder, ok := router.httpsForwarder.(*traefiktcp.TLSHandler)
++	require.True(t, ok)
++	_, isPostTLS := httpsForwarder.Next.(*postTLSRouter)
++	assert.True(t, isPostTLS)
++
++	handler, _ := router.muxerHTTPS.Match(mustConnData(t, "test.localhost"))
++	tlsHandler, ok := handler.(*traefiktcp.TLSHandler)
++	require.True(t, ok)
++	_, isPostTLS = tlsHandler.Next.(*postTLSRouter)
++	assert.True(t, isPostTLS)
++}
++
++func mustConnData(t *testing.T, serverName string) tcpmuxer.ConnData {
++	t.Helper()
++
++	connData, err := tcpmuxer.NewConnData(serverName, &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 4242}, nil)
++	require.NoError(t, err)
++
++	return connData
++}
+diff --git a/pkg/server/server_entrypoint_tcp.go b/pkg/server/server_entrypoint_tcp.go
+index 402331828..38b912132 100644
+--- a/pkg/server/server_entrypoint_tcp.go
++++ b/pkg/server/server_entrypoint_tcp.go
+@@ -212,7 +212,9 @@ func NewTCPEntryPoint(ctx context.Context, name string, config *static.EntryPoin
+ 		return nil, fmt.Errorf("creating HTTP3 server: %w", err)
+ 	}
+ 
+-	rt.SetHTTPSForwarder(httpsServer.Forwarder)
++	// The post-TLS routing stage performs the handshake net/http would otherwise
++	// perform lazily, hence it needs the same timeout net/http would have applied.
++	rt.SetHTTPSForwarder(httpsServer.Forwarder, time.Duration(config.Transport.RespondingTimeouts.ReadTimeout))
+ 
+ 	tcpSwitcher := &tcp.HandlerSwitcher{}
+ 	tcpSwitcher.Switch(rt)
+@@ -367,7 +369,7 @@ func (e *TCPEntryPoint) SwitchRouter(rt *tcprouter.Router) {
+ 
+ 	e.httpServer.Switcher.UpdateHandler(httpHandler)
+ 
+-	rt.SetHTTPSForwarder(e.httpsServer.Forwarder)
++	rt.SetHTTPSForwarder(e.httpsServer.Forwarder, time.Duration(e.transportConfiguration.RespondingTimeouts.ReadTimeout))
+ 
+ 	httpsHandler := rt.GetHTTPSHandler()
+ 	if httpsHandler == nil {

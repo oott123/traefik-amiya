@@ -1,0 +1,285 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: claude <noreply@anthropic.com>
+Date: Fri, 7 Aug 2026 21:04:30 +0800
+Subject: [PATCH] Serve the sniffed connections through the HTTPS server
+
+Assisted-by: Claude Opus 5
+---
+ pkg/server/server_entrypoint_tcp.go      |  53 ++++++++-
+ pkg/server/server_entrypoint_tcp_test.go | 140 ++++++++++++++++++++++-
+ 2 files changed, 187 insertions(+), 6 deletions(-)
+
+diff --git a/pkg/server/server_entrypoint_tcp.go b/pkg/server/server_entrypoint_tcp.go
+index 38b912132..0b9ae096a 100644
+--- a/pkg/server/server_entrypoint_tcp.go
++++ b/pkg/server/server_entrypoint_tcp.go
+@@ -195,14 +195,14 @@ func NewTCPEntryPoint(ctx context.Context, name string, config *static.EntryPoin
+ 
+ 	reqDecorator := requestdecorator.New(hostResolverConfig)
+ 
+-	httpServer, err := newHTTPServer(ctx, listener, config, true, reqDecorator)
++	httpServer, err := newHTTPServer(ctx, listener, config, true, false, reqDecorator)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("creating HTTP server: %w", err)
+ 	}
+ 
+ 	rt.SetHTTPForwarder(httpServer.Forwarder)
+ 
+-	httpsServer, err := newHTTPServer(ctx, listener, config, false, reqDecorator)
++	httpsServer, err := newHTTPServer(ctx, listener, config, false, true, reqDecorator)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("creating HTTPS server: %w", err)
+ 	}
+@@ -619,7 +619,10 @@ type httpServer struct {
+ 	Switcher  *middlewares.HTTPHandlerSwitcher
+ }
+ 
+-func newHTTPServer(ctx context.Context, ln net.Listener, configuration *static.EntryPoint, withH2c bool, reqDecorator *requestdecorator.RequestDecorator) (*httpServer, error) {
++// newHTTPServer builds the HTTP server of an entryPoint.
++// tlsTerminated tells whether it serves the connections the HTTPS path terminated,
++// which the post-TLS routing stage hands over as replayed plaintext streams.
++func newHTTPServer(ctx context.Context, ln net.Listener, configuration *static.EntryPoint, withH2c, tlsTerminated bool, reqDecorator *requestdecorator.RequestDecorator) (*httpServer, error) {
+ 	if configuration.HTTP2.MaxConcurrentStreams < 0 {
+ 		return nil, errors.New("max concurrent streams value must be greater than or equal to zero")
+ 	}
+@@ -659,7 +662,12 @@ func newHTTPServer(ctx context.Context, ln net.Listener, configuration *static.E
+ 	protocols.SetHTTP2(true)
+ 
+ 	// With the addition of UnencryptedHTTP2 in http.Server#Protocols in go1.24 setting the h2c handler is not necessary anymore.
+-	protocols.SetUnencryptedHTTP2(withH2c)
++	// The HTTPS server also needs it: a connection which negotiated h2 and went
++	// through the post-TLS sniffing is handed over as a plaintext stream replaying
++	// the preface, and this is the channel net/http serves it through. It is a no-op
++	// for the connections that were not sniffed, as net/http fills their TLS state
++	// before reaching the preface detection.
++	protocols.SetUnencryptedHTTP2(withH2c || tlsTerminated)
+ 
+ 	handler = contenttype.DisableAutoDetection(handler)
+ 
+@@ -679,6 +687,10 @@ func newHTTPServer(ctx context.Context, ln net.Listener, configuration *static.E
+ 
+ 	handler = denyFragment(handler)
+ 
++	if tlsTerminated {
++		handler = restoreTLSState(handler)
++	}
++
+ 	switch configuration.HTTP.UnderscoreHeadersStrategy {
+ 	case "", static.UnderscoreHeadersStrategyKeep:
+ 		// Headers with underscores are forwarded as is.
+@@ -701,6 +713,23 @@ func newHTTPServer(ctx context.Context, ln net.Listener, configuration *static.E
+ 			}
+ 		}
+ 
++		// Connections that went through the post-TLS sniffing are no longer a
++		// *tls.Conn, the handshake state has to be picked up from the wrapper.
++		if peekConn, ok := tcprouter.AsPeekConn(c); ok {
++			// Only the h2 branch needs the state in the context: it reaches net/http
++			// through the unencrypted_http2 channel, which does not fill Request.TLS.
++			// The others are served as TLSStatefulConn, and net/http fills it itself.
++			if _, isStateful := c.(tcprouter.TLSStatefulConn); !isStateful {
++				ctx = tcprouter.AddTLSConnectionStateInContext(ctx, peekConn.TLSState())
++			}
++
++			if tlsConn, ok := peekConn.NetConn().(*tls.Conn); ok {
++				if tlsConnWithOptionsName, ok := tlsConn.NetConn().(tcp.TLSConn); ok {
++					return tcp.AddTLSOptionsNameInContext(ctx, tlsConnWithOptionsName.TLSOptionsName)
++				}
++			}
++		}
++
+ 		return ctx
+ 	})
+ 
+@@ -800,6 +829,22 @@ func denyFragment(h http.Handler) http.Handler {
+ 	})
+ }
+ 
++// restoreTLSState fills Request.TLS from the handshake state carried by the
++// connection context, for the connections the post-TLS routing stage handed over
++// through the unencrypted_http2 channel: net/http cannot tell they are TLS ones, and
++// the HTTP/2 server fills Request.TLS with an empty state, hence the unconditional
++// overwrite. It is a no-op for every other connection, whose Request.TLS net/http
++// fills natively.
++func restoreTLSState(h http.Handler) http.Handler {
++	return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
++		if state, ok := tcprouter.GetTLSConnectionState(req.Context()); ok {
++			req.TLS = state
++		}
++
++		h.ServeHTTP(rw, req)
++	})
++}
++
+ // removeHeadersWithUnderscores removes any request header and trailer whose name contains an underscore character.
+ func removeHeadersWithUnderscores(h http.Handler) http.Handler {
+ 	return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+diff --git a/pkg/server/server_entrypoint_tcp_test.go b/pkg/server/server_entrypoint_tcp_test.go
+index 935b9e7d7..94f5bb15a 100644
+--- a/pkg/server/server_entrypoint_tcp_test.go
++++ b/pkg/server/server_entrypoint_tcp_test.go
+@@ -20,6 +20,7 @@ import (
+ 	"github.com/traefik/traefik/v3/pkg/middlewares/requestdecorator"
+ 	tcprouter "github.com/traefik/traefik/v3/pkg/server/router/tcp"
+ 	"github.com/traefik/traefik/v3/pkg/tcp"
++	"github.com/traefik/traefik/v3/pkg/tls/generate"
+ 	"golang.org/x/net/http2"
+ )
+ 
+@@ -674,7 +675,7 @@ func TestPathOperations(t *testing.T) {
+ 	}
+ 
+ 	// Create the HTTP server using newHTTPServer.
+-	server, err := newHTTPServer(t.Context(), ln, configuration, false, requestdecorator.New(nil))
++	server, err := newHTTPServer(t.Context(), ln, configuration, false, false, requestdecorator.New(nil))
+ 	require.NoError(t, err)
+ 
+ 	server.Switcher.UpdateHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+@@ -817,7 +818,7 @@ func TestHTTP2Config(t *testing.T) {
+ 	configuration.HTTP2.MaxDecoderHeaderTableSize = int32(expectedDecoderTableSize)
+ 
+ 	// Create the HTTP server using newHTTPServer.
+-	server, err := newHTTPServer(t.Context(), ln, configuration, false, requestdecorator.New(nil))
++	server, err := newHTTPServer(t.Context(), ln, configuration, false, false, requestdecorator.New(nil))
+ 	require.NoError(t, err)
+ 
+ 	// Get the underlying HTTP Server.
+@@ -936,3 +937,138 @@ func Test_rejectHeadersWithUnderscores(t *testing.T) {
+ 		})
+ 	}
+ }
++
++// TestPostTLSAppProtocolFallback checks the whole post-TLS routing stage through a
++// real entryPoint: HTTP/1.1 and HTTP/2 clients must keep being served with a correct
++// Request.TLS, and non-HTTP payloads must reach the fallback TCP service with their
++// first bytes intact.
++func TestPostTLSAppProtocolFallback(t *testing.T) {
++	certPEM, keyPEM, err := generate.KeyPair("test.localhost", time.Time{})
++	require.NoError(t, err)
++
++	cert, err := tls.X509KeyPair(certPEM, keyPEM)
++	require.NoError(t, err)
++
++	tlsConf := &tls.Config{
++		Certificates: []tls.Certificate{cert},
++		NextProtos:   []string{"h2", "http/1.1"},
++	}
++
++	router, err := tcprouter.NewRouter(nil)
++	require.NoError(t, err)
++
++	type requestInfo struct {
++		protoMajor int
++		tlsState   *tls.ConnectionState
++	}
++	requestInfos := make(chan requestInfo, 1)
++
++	router.SetHTTPSHandler(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
++		requestInfos <- requestInfo{protoMajor: req.ProtoMajor, tlsState: req.TLS}
++		_, _ = rw.Write([]byte("HTTPS"))
++	}), tlsConf)
++
++	// The fallback service echoes back what it receives, so that the test can check
++	// the bytes consumed while sniffing were replayed.
++	err = router.AddPostTLSRoute("HostSNI(`test.localhost`) && AppProtocol(`unknown`)", "", 0, "", tcp.HandlerFunc(func(conn tcp.WriteCloser) {
++		_, _ = io.Copy(conn, conn)
++		_ = conn.Close()
++	}))
++	require.NoError(t, err)
++
++	epConfig := &static.EntryPointsTransport{}
++	epConfig.SetDefaults()
++	epConfig.RespondingTimeouts.ReadTimeout = ptypes.Duration(5 * time.Second)
++
++	entryPoint, err := NewTCPEntryPoint(t.Context(), "", &static.EntryPoint{
++		Address:          "127.0.0.1:0",
++		Transport:        epConfig,
++		ForwardedHeaders: &static.ForwardedHeaders{},
++		HTTP2:            &static.HTTP2Config{},
++	}, nil, nil)
++	require.NoError(t, err)
++
++	conn, err := startEntrypoint(t, entryPoint, router)
++	require.NoError(t, err)
++	require.NoError(t, conn.Close())
++
++	epAddr := entryPoint.listener.Addr().String()
++
++	clientTLSConf := func(alpnProtos []string) *tls.Config {
++		return &tls.Config{
++			ServerName:         "test.localhost",
++			InsecureSkipVerify: true,
++			NextProtos:         alpnProtos,
++		}
++	}
++
++	assertTLSState := func(t *testing.T, state *tls.ConnectionState, negotiatedProto string) {
++		t.Helper()
++
++		require.NotNil(t, state)
++		assert.Equal(t, "test.localhost", state.ServerName)
++		assert.Equal(t, negotiatedProto, state.NegotiatedProtocol)
++		assert.True(t, state.HandshakeComplete)
++		assert.GreaterOrEqual(t, state.Version, uint16(tls.VersionTLS12))
++	}
++
++	t.Run("HTTP/1.1 client is served natively", func(t *testing.T) {
++		client := &http.Client{Transport: &http.Transport{
++			TLSClientConfig: clientTLSConf([]string{"http/1.1"}),
++		}}
++		defer client.CloseIdleConnections()
++
++		resp, err := client.Get("https://" + epAddr)
++		require.NoError(t, err)
++		defer resp.Body.Close()
++
++		body, err := io.ReadAll(resp.Body)
++		require.NoError(t, err)
++		assert.Equal(t, "HTTPS", string(body))
++
++		info := <-requestInfos
++		assert.Equal(t, 1, info.protoMajor)
++		assertTLSState(t, info.tlsState, "http/1.1")
++	})
++
++	// This one is the regression sentinel for the unencrypted_http2 channel: the
++	// sniffed connection is no longer a *tls.Conn, yet HTTP/2 must keep working.
++	t.Run("HTTP/2 client goes through the unencrypted_http2 channel", func(t *testing.T) {
++		transport := &http.Transport{TLSClientConfig: clientTLSConf([]string{"h2"})}
++		require.NoError(t, http2.ConfigureTransport(transport))
++
++		client := &http.Client{Transport: transport}
++		defer client.CloseIdleConnections()
++
++		resp, err := client.Get("https://" + epAddr)
++		require.NoError(t, err)
++		defer resp.Body.Close()
++
++		body, err := io.ReadAll(resp.Body)
++		require.NoError(t, err)
++		assert.Equal(t, "HTTPS", string(body))
++
++		info := <-requestInfos
++		assert.Equal(t, 2, info.protoMajor)
++		assertTLSState(t, info.tlsState, "h2")
++	})
++
++	for _, alpnProtos := range [][]string{{"http/1.1"}, {"h2"}} {
++		t.Run("Binary payload with ALPN "+alpnProtos[0]+" reaches the fallback service", func(t *testing.T) {
++			tlsClient, err := tls.Dial("tcp", epAddr, clientTLSConf(alpnProtos))
++			require.NoError(t, err)
++			defer tlsClient.Close()
++
++			require.NoError(t, tlsClient.SetDeadline(time.Now().Add(5*time.Second)))
++
++			payload := "\x05\x01\x00some binary payload"
++			_, err = tlsClient.Write([]byte(payload))
++			require.NoError(t, err)
++
++			got := make([]byte, len(payload))
++			_, err = io.ReadFull(tlsClient, got)
++			require.NoError(t, err)
++			assert.Equal(t, payload, string(got))
++		})
++	}
++}

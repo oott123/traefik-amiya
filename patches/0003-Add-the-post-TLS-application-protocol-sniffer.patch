@@ -1,0 +1,497 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: claude <noreply@anthropic.com>
+Date: Fri, 7 Aug 2026 20:54:13 +0800
+Subject: [PATCH] Add the post-TLS application protocol sniffer
+
+Assisted-by: Claude Opus 5
+---
+ pkg/server/router/tcp/appproto.go      | 125 +++++++++
+ pkg/server/router/tcp/appproto_test.go | 347 +++++++++++++++++++++++++
+ 2 files changed, 472 insertions(+)
+ create mode 100644 pkg/server/router/tcp/appproto.go
+ create mode 100644 pkg/server/router/tcp/appproto_test.go
+
+diff --git a/pkg/server/router/tcp/appproto.go b/pkg/server/router/tcp/appproto.go
+new file mode 100644
+index 000000000..332a7df7d
+--- /dev/null
++++ b/pkg/server/router/tcp/appproto.go
+@@ -0,0 +1,125 @@
++package tcp
++
++import (
++	"time"
++
++	tcpmuxer "github.com/traefik/traefik/v3/pkg/muxer/tcp"
++	"golang.org/x/net/http/httpguts"
++)
++
++// Application protocols the post-TLS routing stage can detect,
++// aliased from the AppProtocol matcher value domain.
++const (
++	AppProtoHTTP1   = tcpmuxer.AppProtoHTTP1
++	AppProtoH2      = tcpmuxer.AppProtoH2
++	AppProtoUnknown = tcpmuxer.AppProtoUnknown
++)
++
++// appProtoSniffTimeout bounds how long the post-TLS routing stage waits for the
++// bytes it needs to make a decision. A client that stays silent longer than that
++// (a browser pre-connecting, for instance) goes down the regular HTTPS path.
++const appProtoSniffTimeout = 500 * time.Millisecond
++
++// maxMethodLen bounds the length of an HTTP method name. RFC 9110 does not limit
++// it, but without a limit there is no way to conclude within a bounded number of
++// bytes. The longest IANA-registered method, UPDATEREDIRECTREF, is 17 characters.
++const maxMethodLen = 32
++
++var http2Preface = []byte("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
++
++// sniffAppProtocol detects the application protocol of the decrypted stream,
++// without consuming any byte from it. It returns an error when no conclusion can
++// be reached, which happens on timeout, EOF, or read error.
++//
++// The detection branches on the ALPN protocol negotiated during the handshake,
++// because that result is binding for the connection: this is exactly what net/http
++// does for a connection that was never sniffed. A connection that negotiated h2
++// goes to the HTTP/2 server, which closes it unless it starts with the preface; a
++// connection that negotiated http/1.1 or nothing goes to the HTTP/1.x branch, which
++// never looks for a preface. Trying both payloads instead would make the sniffed
++// path more permissive than the unsniffed one, meaning configuring a post-TLS route
++// would change how non-matching traffic is served.
++func sniffAppProtocol(conn *PeekConn, negotiatedProto string) (string, error) {
++	switch negotiatedProto {
++	case AppProtoH2:
++		return sniffHTTP2Preface(conn)
++	case AppProtoHTTP1, "":
++		// An empty negotiated protocol does not mean the client sent no ALPN
++		// extension: crypto/tls also returns it for the http/1.1 fallback case,
++		// hence grouping it with http/1.1.
++		return sniffHTTP1RequestLine(conn)
++	default:
++		// Any other protocol (acme-tls/1 and the likes) is served by whoever
++		// claimed the connection at the ClientHello stage.
++		return AppProtoUnknown, nil
++	}
++}
++
++// sniffHTTP2Preface reports whether the stream starts with the HTTP/2 client preface.
++// Peeking one more byte per round keeps it from blocking on a payload shorter than
++// the preface that expects a response before sending more.
++func sniffHTTP2Preface(conn *PeekConn) (string, error) {
++	for i := 1; i <= len(http2Preface); i++ {
++		peeked, err := conn.Peek(i)
++		if err != nil {
++			return "", err
++		}
++
++		if peeked[i-1] != http2Preface[i-1] {
++			return AppProtoUnknown, nil
++		}
++	}
++
++	return AppProtoH2, nil
++}
++
++// sniffHTTP1RequestLine reports whether the stream starts with something net/http
++// would accept as a request line, that is `<token>{1,maxMethodLen} SP <VCHAR>`.
++//
++// This is deliberately not a method allow-list: RFC 9110 defines extension-method
++// as a bare token, and net/http validates methods with isToken alone, so an
++// allow-list would send perfectly valid requests (QUERY, the WebDAV and CalDAV
++// methods, any custom one) to the fallback backend. The two ways of being wrong are
++// not equally costly: a valid HTTP request silently delivered to the fallback
++// backend is a permanent breakage, whereas a fallback payload mistaken for HTTP only
++// gets a 400 and a closed connection.
++func sniffHTTP1RequestLine(conn *PeekConn) (string, error) {
++	for i := 1; ; i++ {
++		peeked, err := conn.Peek(i)
++		if err != nil {
++			return "", err
++		}
++
++		switch c := peeked[i-1]; {
++		case c == ' ' && i > 1:
++			// net/http cuts the request line on that space, and fails later on
++			// unless what follows is a non-empty target made of visible characters.
++			target, err := conn.Peek(i + 1)
++			if err != nil {
++				return "", err
++			}
++
++			if isVCHAR(target[i]) {
++				return AppProtoHTTP1, nil
++			}
++
++			return AppProtoUnknown, nil
++
++		case isTchar(c) && i <= maxMethodLen:
++			continue
++
++		default:
++			return AppProtoUnknown, nil
++		}
++	}
++}
++
++// isTchar reports whether c is a token character, as net/http understands it.
++func isTchar(c byte) bool {
++	return httpguts.IsTokenRune(rune(c))
++}
++
++// isVCHAR reports whether c is a visible ASCII character.
++func isVCHAR(c byte) bool {
++	return c >= 0x21 && c <= 0x7E
++}
+diff --git a/pkg/server/router/tcp/appproto_test.go b/pkg/server/router/tcp/appproto_test.go
+new file mode 100644
+index 000000000..e6d98cf38
+--- /dev/null
++++ b/pkg/server/router/tcp/appproto_test.go
+@@ -0,0 +1,347 @@
++package tcp
++
++import (
++	"bufio"
++	"net"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++func Test_sniffAppProtocol(t *testing.T) {
++	testCases := []struct {
++		desc            string
++		negotiatedProto string
++		payload         string
++		expected        string
++		// undecided is the "cannot conclude" runtime state: the payload does not
++		// carry enough bytes, and no more come before the deadline.
++		undecided bool
++	}{
++		// Classic HTTP methods.
++		{
++			desc:     "GET",
++			payload:  "GET / HTTP/1.1\r\n",
++			expected: AppProtoHTTP1,
++		},
++		{
++			desc:     "HEAD",
++			payload:  "HEAD / HTTP/1.1\r\n",
++			expected: AppProtoHTTP1,
++		},
++		{
++			desc:     "POST",
++			payload:  "POST /form HTTP/1.1\r\n",
++			expected: AppProtoHTTP1,
++		},
++		{
++			desc:     "PUT",
++			payload:  "PUT /obj HTTP/1.1\r\n",
++			expected: AppProtoHTTP1,
++		},
++		{
++			desc:     "DELETE",
++			payload:  "DELETE /obj HTTP/1.1\r\n",
++			expected: AppProtoHTTP1,
++		},
++		{
++			desc:     "OPTIONS",
++			payload:  "OPTIONS * HTTP/1.1\r\n",
++			expected: AppProtoHTTP1,
++		},
++		{
++			desc:     "TRACE",
++			payload:  "TRACE / HTTP/1.1\r\n",
++			expected: AppProtoHTTP1,
++		},
++		{
++			desc:     "PATCH",
++			payload:  "PATCH /obj HTTP/1.1\r\n",
++			expected: AppProtoHTTP1,
++		},
++		{
++			desc:     "CONNECT (authority-form)",
++			payload:  "CONNECT example.com:443 HTTP/1.1\r\n",
++			expected: AppProtoHTTP1,
++		},
++		{
++			desc:     "GET (absolute-form)",
++			payload:  "GET http://example.com/ HTTP/1.1\r\n",
++			expected: AppProtoHTTP1,
++		},
++
++		// Methods a hardcoded allow-list would miss. This group is the sentinel
++		// guarding against a regression back to a method allow-list.
++		{
++			desc:     "QUERY",
++			payload:  "QUERY /search HTTP/1.1\r\n",
++			expected: AppProtoHTTP1,
++		},
++		{
++			desc:     "PROPFIND",
++			payload:  "PROPFIND /dav HTTP/1.1\r\n",
++			expected: AppProtoHTTP1,
++		},
++		{
++			desc:     "PROPPATCH",
++			payload:  "PROPPATCH /dav HTTP/1.1\r\n",
++			expected: AppProtoHTTP1,
++		},
++		{
++			desc:     "MKCOL",
++			payload:  "MKCOL /dav/dir HTTP/1.1\r\n",
++			expected: AppProtoHTTP1,
++		},
++		{
++			desc:     "COPY",
++			payload:  "COPY /dav/a HTTP/1.1\r\n",
++			expected: AppProtoHTTP1,
++		},
++		{
++			desc:     "MOVE",
++			payload:  "MOVE /dav/a HTTP/1.1\r\n",
++			expected: AppProtoHTTP1,
++		},
++		{
++			desc:     "LOCK",
++			payload:  "LOCK /dav/a HTTP/1.1\r\n",
++			expected: AppProtoHTTP1,
++		},
++		{
++			desc:     "UNLOCK",
++			payload:  "UNLOCK /dav/a HTTP/1.1\r\n",
++			expected: AppProtoHTTP1,
++		},
++		{
++			desc:     "REPORT",
++			payload:  "REPORT /cal HTTP/1.1\r\n",
++			expected: AppProtoHTTP1,
++		},
++		{
++			desc:     "MKCALENDAR",
++			payload:  "MKCALENDAR /cal HTTP/1.1\r\n",
++			expected: AppProtoHTTP1,
++		},
++		{
++			desc:     "custom token method",
++			payload:  "X-FOO!#$%&'*+-.^_`|~0 / HTTP/1.1\r\n",
++			expected: AppProtoHTTP1,
++		},
++
++		// The HTTP/2 preface is a valid HTTP/1.x request line, and net/http parses
++		// it as such on a connection that did not negotiate h2.
++		{
++			desc:     "HTTP/2 preface on the http/1.1 branch",
++			payload:  string(http2Preface),
++			expected: AppProtoHTTP1,
++		},
++
++		// Boundaries.
++		{
++			desc:     "method name of exactly maxMethodLen characters",
++			payload:  strings.Repeat("A", maxMethodLen) + " / HTTP/1.1\r\n",
++			expected: AppProtoHTTP1,
++		},
++		{
++			desc:     "method name one character too long",
++			payload:  strings.Repeat("A", maxMethodLen+1) + " / HTTP/1.1\r\n",
++			expected: AppProtoUnknown,
++		},
++		{
++			desc:     "empty request target",
++			payload:  "GET  HTTP/1.1\r\n",
++			expected: AppProtoUnknown,
++		},
++		{
++			desc:     "control character as request target",
++			payload:  "GET \x01 HTTP/1.1\r\n",
++			expected: AppProtoUnknown,
++		},
++		{
++			desc:     "non-token character in the method name",
++			payload:  "GE(T / HTTP/1.1\r\n",
++			expected: AppProtoUnknown,
++		},
++		{
++			desc:     "leading space",
++			payload:  " GET / HTTP/1.1\r\n",
++			expected: AppProtoUnknown,
++		},
++
++		// Binary payloads.
++		{
++			desc:     "null first byte",
++			payload:  "\x00\x01\x02\x03",
++			expected: AppProtoUnknown,
++		},
++		{
++			desc:     "SOCKS5-like first byte",
++			payload:  "\x05\x01\x00",
++			expected: AppProtoUnknown,
++		},
++		{
++			desc:     "Trojan-like hex header",
++			payload:  strings.Repeat("a1", 28) + "\r\n\x01\x03",
++			expected: AppProtoUnknown,
++		},
++
++		// No conclusion possible.
++		{
++			desc:      "silence after a partial method name",
++			payload:   "GE",
++			undecided: true,
++		},
++		{
++			desc:      "no payload at all",
++			payload:   "",
++			undecided: true,
++		},
++		{
++			desc:      "silence right after the method name space",
++			payload:   "GET ",
++			undecided: true,
++		},
++
++		// h2 branch.
++		{
++			desc:            "complete preface",
++			negotiatedProto: AppProtoH2,
++			payload:         string(http2Preface),
++			expected:        AppProtoH2,
++		},
++		{
++			desc:            "preface followed by a SETTINGS frame",
++			negotiatedProto: AppProtoH2,
++			payload:         string(http2Preface) + "\x00\x00\x00\x04\x00\x00\x00\x00\x00",
++			expected:        AppProtoH2,
++		},
++		{
++			// The token rule does not apply on the h2 branch: this is the sentinel
++			// for the ALPN-based branching.
++			desc:            "HTTP/1.1 request line on the h2 branch",
++			negotiatedProto: AppProtoH2,
++			payload:         "GET / HTTP/1.1\r\n",
++			expected:        AppProtoUnknown,
++		},
++		{
++			desc:            "first byte differs from the preface",
++			negotiatedProto: AppProtoH2,
++			payload:         "\x00",
++			expected:        AppProtoUnknown,
++		},
++		{
++			desc:            "last preface byte differs",
++			negotiatedProto: AppProtoH2,
++			payload:         string(http2Preface[:len(http2Preface)-1]) + "X",
++			expected:        AppProtoUnknown,
++		},
++		{
++			desc:            "preface truncated one byte short",
++			negotiatedProto: AppProtoH2,
++			payload:         string(http2Preface[:len(http2Preface)-1]),
++			undecided:       true,
++		},
++
++		// Any other negotiated protocol.
++		{
++			desc:            "acme-tls/1 is never sniffed",
++			negotiatedProto: "acme-tls/1",
++			payload:         "GET / HTTP/1.1\r\n",
++			expected:        AppProtoUnknown,
++		},
++	}
++
++	for _, test := range testCases {
++		t.Run(test.negotiatedProto+"/"+test.desc, func(t *testing.T) {
++			t.Parallel()
++
++			serverConn, clientConn := net.Pipe()
++			t.Cleanup(func() {
++				_ = serverConn.Close()
++				_ = clientConn.Close()
++			})
++
++			go func() {
++				if test.payload != "" {
++					_, _ = clientConn.Write([]byte(test.payload))
++				}
++				// The connection is deliberately left open: an undecided case must
++				// come from the sniffing deadline, not from an EOF.
++			}()
++
++			require.NoError(t, serverConn.SetReadDeadline(time.Now().Add(200*time.Millisecond)))
++
++			pConn := &PeekConn{reader: bufio.NewReader(serverConn)}
++
++			appProto, err := sniffAppProtocol(pConn, test.negotiatedProto)
++			if test.undecided {
++				require.Error(t, err)
++				return
++			}
++			require.NoError(t, err)
++
++			assert.Equal(t, test.expected, appProto)
++		})
++	}
++}
++
++func Test_sniffAppProtocol_undecidedOnEOF(t *testing.T) {
++	serverConn, clientConn := net.Pipe()
++	t.Cleanup(func() { _ = serverConn.Close() })
++
++	require.NoError(t, clientConn.Close())
++
++	pConn := &PeekConn{reader: bufio.NewReader(serverConn)}
++
++	_, err := sniffAppProtocol(pConn, AppProtoHTTP1)
++	require.Error(t, err)
++}
++
++func Test_sniffAppProtocol_doesNotConsume(t *testing.T) {
++	serverConn, clientConn := net.Pipe()
++	t.Cleanup(func() {
++		_ = serverConn.Close()
++		_ = clientConn.Close()
++	})
++
++	payload := "\x05\x01\x00some binary payload"
++	go func() { _, _ = clientConn.Write([]byte(payload)) }()
++
++	pConn := &PeekConn{reader: bufio.NewReader(serverConn)}
++
++	appProto, err := sniffAppProtocol(pConn, AppProtoHTTP1)
++	require.NoError(t, err)
++	assert.Equal(t, AppProtoUnknown, appProto)
++
++	got := make([]byte, len(payload))
++	_, err = pConn.Read(got)
++	require.NoError(t, err)
++	assert.Equal(t, payload, string(got))
++}
++
++// Test_sniffAppProtocol_waitsForMoreBytes checks that a payload arriving in several
++// chunks is still decided, as long as it comes before the deadline.
++func Test_sniffAppProtocol_waitsForMoreBytes(t *testing.T) {
++	serverConn, clientConn := net.Pipe()
++	t.Cleanup(func() {
++		_ = serverConn.Close()
++		_ = clientConn.Close()
++	})
++
++	go func() {
++		_, _ = clientConn.Write([]byte("GE"))
++		time.Sleep(50 * time.Millisecond)
++		_, _ = clientConn.Write([]byte("T /index.html HTTP/1.1\r\n"))
++	}()
++
++	require.NoError(t, serverConn.SetReadDeadline(time.Now().Add(appProtoSniffTimeout)))
++
++	pConn := &PeekConn{reader: bufio.NewReader(serverConn)}
++
++	appProto, err := sniffAppProtocol(pConn, AppProtoHTTP1)
++	require.NoError(t, err)
++	assert.Equal(t, AppProtoHTTP1, appProto)
++}
