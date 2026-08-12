@@ -1,0 +1,414 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: claude <noreply@anthropic.com>
+Date: Wed, 12 Aug 2026 23:16:00 +0800
+Subject: [PATCH] Carry the PROXY protocol metadata TLV to the request context
+
+Assisted-by: Claude Opus 5
+---
+ pkg/server/proxy_protocol_meta.go      | 119 ++++++++++++
+ pkg/server/proxy_protocol_meta_test.go | 256 +++++++++++++++++++++++++
+ pkg/server/server_entrypoint_tcp.go    |   2 +
+ 3 files changed, 377 insertions(+)
+ create mode 100644 pkg/server/proxy_protocol_meta.go
+ create mode 100644 pkg/server/proxy_protocol_meta_test.go
+
+diff --git a/pkg/server/proxy_protocol_meta.go b/pkg/server/proxy_protocol_meta.go
+new file mode 100644
+index 000000000..be457fb34
+--- /dev/null
++++ b/pkg/server/proxy_protocol_meta.go
+@@ -0,0 +1,119 @@
++package server
++
++import (
++	"context"
++	"net"
++
++	"github.com/pires/go-proxyproto"
++	"github.com/rs/zerolog/log"
++	"github.com/traefik/traefik/v3/pkg/tcp"
++)
++
++// proxyMetaHeader is the request header carrying the PROXY protocol metadata.
++const proxyMetaHeader = "X-Proxy-Meta"
++
++// pp2TypeMeta is the PROXY protocol v2 TLV type carrying the metadata.
++// It belongs to the experiment range (0xF0-0xF7) the spec leaves unassigned.
++const pp2TypeMeta proxyproto.PP2Type = 0xF3
++
++// maxConnUnwrapDepth bounds the wrapper unwrapping loop, so that a layer
++// returning itself as its underlying connection cannot spin forever.
++const maxConnUnwrapDepth = 16
++
++type proxyProtocolMetaKey struct{}
++
++// proxyProtocolConn digs through the connection wrappers sitting between net/http
++// and the entryPoint listener to find the PROXY protocol connection, if any.
++//
++// The metadata lives on the *proxyproto.Conn the listener returns, but ConnContext
++// is handed the outermost wrapper, which is up to seven layers away on the post-TLS
++// sniffing path: TLSStatefulConn, *PeekConn, *tls.Conn, tcp.TLSConn, *PeekConn,
++// *trackedConnection and *writeCloserWrapper. Most of them expose their underlying
++// connection as NetConn, but the concrete types embedding a tcp.WriteCloser do not,
++// hence the type switch.
++func proxyProtocolConn(c net.Conn) *proxyproto.Conn {
++	for range maxConnUnwrapDepth {
++		if c == nil {
++			return nil
++		}
++
++		switch conn := c.(type) {
++		case *proxyproto.Conn:
++			return conn
++		case tcp.TLSConn:
++			c = conn.WriteCloser
++		case *writeCloserWrapper:
++			c = conn.Conn
++		case *trackedConnection:
++			c = conn.WriteCloser
++		case interface{ NetConn() net.Conn }:
++			// Covers *tls.Conn, and both the ClientHello and the post-TLS PeekConn,
++			// whose constructors are private to the tcp router package.
++			c = conn.NetConn()
++		default:
++			return nil
++		}
++	}
++
++	return nil
++}
++
++// isPrintableASCII reports whether v is a non-empty run of printable ASCII bytes.
++//
++// The 0x20-0x7E range is both within the field-value set RFC 9110 allows, and free
++// of CR and LF by construction, which rules out any header injection through a TLV.
++func isPrintableASCII(v []byte) bool {
++	if len(v) == 0 {
++		return false
++	}
++
++	for _, b := range v {
++		if b < 0x20 || b > 0x7E {
++			return false
++		}
++	}
++
++	return true
++}
++
++// addProxyProtocolMetaInContext stores the metadata TLV values carried by the
++// connection, if any, so that the HTTP handlers can read them back.
++func addProxyProtocolMetaInContext(ctx context.Context, c net.Conn) context.Context {
++	pConn := proxyProtocolConn(c)
++	if pConn == nil {
++		return ctx
++	}
++
++	// A nil header means the upstream address did not pass the entryPoint
++	// proxyProtocol trustedIPs check, so the metadata must not be trusted.
++	header := pConn.ProxyHeader()
++	if header == nil {
++		return ctx
++	}
++
++	tlvs, err := header.TLVs()
++	if err != nil {
++		log.Ctx(ctx).Debug().Err(err).Msg("Unable to parse the PROXY protocol TLVs")
++		return ctx
++	}
++
++	var values []string
++	for _, tlv := range tlvs {
++		if tlv.Type != pp2TypeMeta {
++			continue
++		}
++
++		if !isPrintableASCII(tlv.Value) {
++			log.Ctx(ctx).Debug().Msg("Ignoring the PROXY protocol metadata TLV: the value is empty or not printable ASCII")
++			continue
++		}
++
++		values = append(values, string(tlv.Value))
++	}
++
++	if len(values) == 0 {
++		return ctx
++	}
++
++	return context.WithValue(ctx, proxyProtocolMetaKey{}, values)
++}
+diff --git a/pkg/server/proxy_protocol_meta_test.go b/pkg/server/proxy_protocol_meta_test.go
+new file mode 100644
+index 000000000..3e3d946e5
+--- /dev/null
++++ b/pkg/server/proxy_protocol_meta_test.go
+@@ -0,0 +1,256 @@
++package server
++
++import (
++	"context"
++	"crypto/tls"
++	"net"
++	"testing"
++
++	"github.com/pires/go-proxyproto"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	"github.com/traefik/traefik/v3/pkg/tcp"
++)
++
++// fakeWriteCloser turns a net.Pipe end into a tcp.WriteCloser, so that it can sit
++// at the bottom of the wrapper chains the unwrapping walks through.
++type fakeWriteCloser struct {
++	net.Conn
++}
++
++func (fakeWriteCloser) CloseWrite() error { return nil }
++
++// netConnMock stands for the wrappers exposing their underlying connection through
++// a NetConn method, that is *tls.Conn and both PeekConn flavors: the latter cannot
++// be built from this package, their constructors are private to the tcp router.
++type netConnMock struct {
++	net.Conn
++
++	underlying net.Conn
++}
++
++func (c *netConnMock) NetConn() net.Conn { return c.underlying }
++
++func (c *netConnMock) CloseWrite() error { return nil }
++
++// selfConnMock is a wrapper claiming to be its own underlying connection.
++type selfConnMock struct {
++	net.Conn
++}
++
++func (c *selfConnMock) NetConn() net.Conn { return c }
++
++func TestProxyProtocolConn(t *testing.T) {
++	client, server := net.Pipe()
++	t.Cleanup(func() {
++		_ = client.Close()
++		_ = server.Close()
++	})
++
++	leaf := fakeWriteCloser{Conn: server}
++	pConn := proxyproto.NewConn(leaf)
++
++	// The deepest chain, as built by the post-TLS sniffing path.
++	deep := &netConnMock{underlying: tls.Server(tcp.TLSConn{
++		WriteCloser: &netConnMock{
++			underlying: &trackedConnection{
++				WriteCloser: &writeCloserWrapper{Conn: pConn},
++			},
++		},
++	}, &tls.Config{})}
++
++	testCases := []struct {
++		desc     string
++		conn     net.Conn
++		expected *proxyproto.Conn
++	}{
++		{
++			desc:     "bare PROXY protocol connection",
++			conn:     pConn,
++			expected: pConn,
++		},
++		{
++			desc:     "write closer wrapper",
++			conn:     &writeCloserWrapper{Conn: pConn},
++			expected: pConn,
++		},
++		{
++			desc:     "tracked connection",
++			conn:     &trackedConnection{WriteCloser: &writeCloserWrapper{Conn: pConn}},
++			expected: pConn,
++		},
++		{
++			desc:     "TLS connection carrying the TLS options name",
++			conn:     tcp.TLSConn{WriteCloser: &writeCloserWrapper{Conn: pConn}},
++			expected: pConn,
++		},
++		{
++			desc:     "TLS connection",
++			conn:     tls.Server(pConn, &tls.Config{}),
++			expected: pConn,
++		},
++		{
++			desc:     "wrapper exposing NetConn",
++			conn:     &netConnMock{underlying: pConn},
++			expected: pConn,
++		},
++		{
++			desc:     "post-TLS sniffing chain",
++			conn:     deep,
++			expected: pConn,
++		},
++		{
++			desc: "no PROXY protocol connection",
++			conn: &writeCloserWrapper{Conn: leaf},
++		},
++		{
++			desc: "nil connection",
++		},
++		{
++			desc: "self-referencing wrapper",
++			conn: &selfConnMock{Conn: leaf},
++		},
++	}
++
++	for _, test := range testCases {
++		t.Run(test.desc, func(t *testing.T) {
++			t.Parallel()
++
++			assert.Same(t, test.expected, proxyProtocolConn(test.conn))
++		})
++	}
++}
++
++func TestIsPrintableASCII(t *testing.T) {
++	testCases := []struct {
++		desc     string
++		value    []byte
++		expected bool
++	}{
++		{desc: "nil"},
++		{desc: "empty", value: []byte{}},
++		{desc: "printable", value: []byte("tenant=acme"), expected: true},
++		{desc: "space", value: []byte(" "), expected: true},
++		{desc: "tilde", value: []byte("~"), expected: true},
++		{desc: "unit separator", value: []byte{0x1F}},
++		{desc: "delete", value: []byte{0x7F}},
++		{desc: "non ASCII", value: []byte{0x80}},
++		{desc: "UTF-8", value: []byte("café")},
++		{desc: "NUL", value: []byte("bad\x00value")},
++		{desc: "TAB", value: []byte("bad\tvalue")},
++		{desc: "CRLF", value: []byte("bad\r\nvalue")},
++	}
++
++	for _, test := range testCases {
++		t.Run(test.desc, func(t *testing.T) {
++			t.Parallel()
++
++			assert.Equal(t, test.expected, isPrintableASCII(test.value))
++		})
++	}
++}
++
++func TestAddProxyProtocolMetaInContext(t *testing.T) {
++	testCases := []struct {
++		desc     string
++		version  byte
++		tlvs     []proxyproto.TLV
++		expected []string
++	}{
++		{
++			desc:     "metadata TLV",
++			version:  2,
++			tlvs:     []proxyproto.TLV{{Type: pp2TypeMeta, Value: []byte("tenant=acme")}},
++			expected: []string{"tenant=acme"},
++		},
++		{
++			desc:    "no TLV",
++			version: 2,
++		},
++		{
++			desc:    "no metadata TLV",
++			version: 2,
++			tlvs:    []proxyproto.TLV{{Type: proxyproto.PP2_TYPE_AUTHORITY, Value: []byte("example.com")}},
++		},
++		{
++			desc:    "empty metadata TLV",
++			version: 2,
++			tlvs:    []proxyproto.TLV{{Type: pp2TypeMeta, Value: []byte{}}},
++		},
++		{
++			desc:    "metadata TLV with a control character",
++			version: 2,
++			tlvs:    []proxyproto.TLV{{Type: pp2TypeMeta, Value: []byte("bad\r\nvalue")}},
++		},
++		{
++			desc:    "metadata TLV with a non ASCII byte",
++			version: 2,
++			tlvs:    []proxyproto.TLV{{Type: pp2TypeMeta, Value: []byte("café")}},
++		},
++		{
++			desc:    "several metadata TLVs",
++			version: 2,
++			tlvs: []proxyproto.TLV{
++				{Type: pp2TypeMeta, Value: []byte("first")},
++				{Type: pp2TypeMeta, Value: []byte("second")},
++			},
++			expected: []string{"first", "second"},
++		},
++		{
++			desc:    "several metadata TLVs, one of them invalid",
++			version: 2,
++			tlvs: []proxyproto.TLV{
++				{Type: pp2TypeMeta, Value: []byte("first")},
++				{Type: pp2TypeMeta, Value: []byte("\x00")},
++				{Type: pp2TypeMeta, Value: []byte("third")},
++			},
++			expected: []string{"first", "third"},
++		},
++		{
++			desc:    "version 1 header",
++			version: 1,
++		},
++	}
++
++	for _, test := range testCases {
++		t.Run(test.desc, func(t *testing.T) {
++			t.Parallel()
++
++			header := &proxyproto.Header{
++				Version:           test.version,
++				Command:           proxyproto.PROXY,
++				TransportProtocol: proxyproto.TCPv4,
++				SourceAddr:        &net.TCPAddr{IP: net.ParseIP("10.0.0.1"), Port: 1000},
++				DestinationAddr:   &net.TCPAddr{IP: net.ParseIP("10.0.0.2"), Port: 2000},
++			}
++			require.NoError(t, header.SetTLVs(test.tlvs))
++
++			client, server := net.Pipe()
++			t.Cleanup(func() {
++				_ = client.Close()
++				_ = server.Close()
++			})
++
++			go func() {
++				_, _ = header.WriteTo(client)
++			}()
++
++			ctx := addProxyProtocolMetaInContext(context.Background(), proxyproto.NewConn(server))
++
++			values, _ := ctx.Value(proxyProtocolMetaKey{}).([]string)
++			assert.Equal(t, test.expected, values)
++		})
++	}
++}
++
++func TestAddProxyProtocolMetaInContextWithoutProxyProtocol(t *testing.T) {
++	client, server := net.Pipe()
++	t.Cleanup(func() {
++		_ = client.Close()
++		_ = server.Close()
++	})
++
++	ctx := addProxyProtocolMetaInContext(context.Background(), fakeWriteCloser{Conn: server})
++
++	assert.Nil(t, ctx.Value(proxyProtocolMetaKey{}))
++}
+diff --git a/pkg/server/server_entrypoint_tcp.go b/pkg/server/server_entrypoint_tcp.go
+index 0b9ae096a..13aaaebe2 100644
+--- a/pkg/server/server_entrypoint_tcp.go
++++ b/pkg/server/server_entrypoint_tcp.go
+@@ -733,6 +733,8 @@ func newHTTPServer(ctx context.Context, ln net.Listener, configuration *static.E
+ 		return ctx
+ 	})
+ 
++	connContext.AddConnContextFunc(addProxyProtocolMetaInContext)
++
+ 	if debugConnection || (configuration.Transport != nil && (configuration.Transport.KeepAliveMaxTime > 0 || configuration.Transport.KeepAliveMaxRequests > 0)) {
+ 		connContext.AddConnContextFunc(func(ctx context.Context, c net.Conn) context.Context {
+ 			cState := &connState{Start: time.Now()}

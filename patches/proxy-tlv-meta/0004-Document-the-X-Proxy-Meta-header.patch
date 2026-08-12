@@ -1,0 +1,100 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: claude <noreply@anthropic.com>
+Date: Wed, 12 Aug 2026 23:27:00 +0800
+Subject: [PATCH] Document the X-Proxy-Meta header
+
+Assisted-by: Claude Opus 5
+---
+ .../install-configuration/entrypoints.md      | 79 +++++++++++++++++++
+ 1 file changed, 79 insertions(+)
+
+diff --git a/docs/content/reference/install-configuration/entrypoints.md b/docs/content/reference/install-configuration/entrypoints.md
+index 9af69551a..9874f2f8e 100644
+--- a/docs/content/reference/install-configuration/entrypoints.md
++++ b/docs/content/reference/install-configuration/entrypoints.md
+@@ -490,6 +490,85 @@ When queuing Traefik behind another load-balancer, make sure to configure
+ PROXY protocol on both sides.
+ Not doing so could introduce a security risk in your system (enabling request forgery).
+ 
++### PROXY Protocol Metadata
++
++A PROXY protocol version 2 header can carry arbitrary metadata as Type-Length-Value
++records (TLV). Traefik reads the TLV of type `0xF3`, and passes its value to the
++requests of that connection as the `X-Proxy-Meta` header.
++
++There is nothing to configure beyond `proxyProtocol` itself:
++
++```yaml tab="File (YAML)"
++## Static configuration
++entryPoints:
++  web:
++    address: ":80"
++    proxyProtocol:
++      trustedIPs:
++        - "10.0.0.0/8"
++```
++
++```toml tab="File (TOML)"
++## Static configuration
++[entryPoints]
++  [entryPoints.web]
++    address = ":80"
++
++    [entryPoints.web.proxyProtocol]
++      trustedIPs = ["10.0.0.0/8"]
++```
++
++```bash tab="CLI"
++## Static configuration
++--entryPoints.web.address=:80
++--entryPoints.web.proxyProtocol.trustedIPs=10.0.0.0/8
++```
++
++The header is set before the HTTP router matches, so routing rules and middlewares
++can both rely on it:
++
++```yaml tab="File (YAML)"
++## Routing configuration
++http:
++  routers:
++    tenant-acme:
++      entryPoints:
++        - web
++      rule: "Host(`example.com`) && Header(`X-Proxy-Meta`, `tenant=acme`)"
++      service: acme-backend
++```
++
++```toml tab="File (TOML)"
++## Routing configuration
++[http.routers]
++  [http.routers.tenant-acme]
++    entryPoints = ["web"]
++    rule = "Host(`example.com`) && Header(`X-Proxy-Meta`, `tenant=acme`)"
++    service = "acme-backend"
++```
++
++The value is passed as is: it is not decoded, unescaped, or trimmed. A TLV is
++ignored when its value is empty, or when it holds a byte outside of the printable
++ASCII range (`0x20`-`0x7E`), which rules out any header injection. When the PROXY
++protocol header carries several `0xF3` TLVs, `X-Proxy-Meta` holds one value per
++TLV, in the order they appear in the header, and the invalid ones are skipped.
++
++!!! info "The header cannot be forged"
++
++    An `X-Proxy-Meta` header sent by a client is always removed, on every
++    entryPoint, whether it enables `proxyProtocol` or not. A backend receiving
++    this header knows it comes from a TLV.
++
++    The metadata is only as trustworthy as the PROXY protocol header carrying it,
++    which the entryPoint `proxyProtocol.trustedIPs` and `proxyProtocol.insecure`
++    options already govern: the TLVs of a connection coming from an untrusted
++    address are ignored, exactly as its addresses are.
++
++!!! warning "HTTP/3"
++
++    HTTP/3 runs over QUIC, which has no PROXY protocol, so `X-Proxy-Meta` is never
++    set for an HTTP/3 request. It is still removed from the incoming request.
++
+ ### reusePort
+ 
+ #### Examples

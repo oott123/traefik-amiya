@@ -1,0 +1,165 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: claude <noreply@anthropic.com>
+Date: Wed, 12 Aug 2026 23:19:02 +0800
+Subject: [PATCH] Inject the PROXY protocol metadata as the X-Proxy-Meta header
+
+Assisted-by: Claude Opus 5
+---
+ pkg/server/proxy_protocol_meta.go      | 22 +++++++
+ pkg/server/proxy_protocol_meta_test.go | 82 ++++++++++++++++++++++++++
+ pkg/server/server_entrypoint_tcp.go    |  2 +-
+ 3 files changed, 105 insertions(+), 1 deletion(-)
+
+diff --git a/pkg/server/proxy_protocol_meta.go b/pkg/server/proxy_protocol_meta.go
+index be457fb34..40fd6202d 100644
+--- a/pkg/server/proxy_protocol_meta.go
++++ b/pkg/server/proxy_protocol_meta.go
+@@ -3,6 +3,7 @@ package server
+ import (
+ 	"context"
+ 	"net"
++	"net/http"
+ 
+ 	"github.com/pires/go-proxyproto"
+ 	"github.com/rs/zerolog/log"
+@@ -117,3 +118,24 @@ func addProxyProtocolMetaInContext(ctx context.Context, c net.Conn) context.Cont
+ 
+ 	return context.WithValue(ctx, proxyProtocolMetaKey{}, values)
+ }
++
++// proxyProtocolMeta replaces the X-Proxy-Meta header with the values carried by
++// the connection PROXY protocol header.
++// It is an alice.Constructor, so that it can be mounted at the head of the
++// entryPoint handler chain, ahead of the HTTP router.
++func proxyProtocolMeta(next http.Handler) (http.Handler, error) {
++	return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
++		// The removal is unconditional, whether the entryPoint enables proxyProtocol
++		// or not: it is the only thing making the header trustworthy, a backend seeing
++		// it knows it comes from a TLV.
++		req.Header.Del(proxyMetaHeader)
++
++		if values, ok := req.Context().Value(proxyProtocolMetaKey{}).([]string); ok {
++			for _, value := range values {
++				req.Header.Add(proxyMetaHeader, value)
++			}
++		}
++
++		next.ServeHTTP(rw, req)
++	}), nil
++}
+diff --git a/pkg/server/proxy_protocol_meta_test.go b/pkg/server/proxy_protocol_meta_test.go
+index 3e3d946e5..18be8ab06 100644
+--- a/pkg/server/proxy_protocol_meta_test.go
++++ b/pkg/server/proxy_protocol_meta_test.go
+@@ -1,9 +1,13 @@
+ package server
+ 
+ import (
++	"bufio"
+ 	"context"
+ 	"crypto/tls"
+ 	"net"
++	"net/http"
++	"net/http/httptest"
++	"strings"
+ 	"testing"
+ 
+ 	"github.com/pires/go-proxyproto"
+@@ -243,6 +247,84 @@ func TestAddProxyProtocolMetaInContext(t *testing.T) {
+ 	}
+ }
+ 
++func TestProxyProtocolMeta(t *testing.T) {
++	testCases := []struct {
++		desc          string
++		values        []string
++		clientHeaders http.Header
++		expected      []string
++	}{
++		{
++			desc:          "no metadata, forged client header",
++			clientHeaders: http.Header{proxyMetaHeader: []string{"evil"}},
++		},
++		{
++			desc:          "one value, forged client header",
++			values:        []string{"tenant=acme"},
++			clientHeaders: http.Header{proxyMetaHeader: []string{"evil"}},
++			expected:      []string{"tenant=acme"},
++		},
++		{
++			desc:     "several values",
++			values:   []string{"first", "second"},
++			expected: []string{"first", "second"},
++		},
++		{
++			desc:          "several values, several forged client values",
++			values:        []string{"first", "second"},
++			clientHeaders: http.Header{proxyMetaHeader: []string{"evil", "eviler"}},
++			expected:      []string{"first", "second"},
++		},
++	}
++
++	for _, test := range testCases {
++		t.Run(test.desc, func(t *testing.T) {
++			t.Parallel()
++
++			var got []string
++			handler, err := proxyProtocolMeta(http.HandlerFunc(func(_ http.ResponseWriter, req *http.Request) {
++				got = req.Header.Values(proxyMetaHeader)
++			}))
++			require.NoError(t, err)
++
++			req := httptest.NewRequest(http.MethodGet, "http://example.com", nil)
++			for name, values := range test.clientHeaders {
++				for _, value := range values {
++					req.Header.Add(name, value)
++				}
++			}
++
++			if test.values != nil {
++				req = req.WithContext(context.WithValue(req.Context(), proxyProtocolMetaKey{}, test.values))
++			}
++
++			handler.ServeHTTP(httptest.NewRecorder(), req)
++
++			assert.Equal(t, test.expected, got)
++		})
++	}
++}
++
++// TestProxyProtocolMetaStripsNonCanonicalHeader reads the request off the wire, so
++// that the forged header goes through the net/http name canonicalization the
++// removal relies on.
++func TestProxyProtocolMetaStripsNonCanonicalHeader(t *testing.T) {
++	var got []string
++	handler, err := proxyProtocolMeta(http.HandlerFunc(func(_ http.ResponseWriter, req *http.Request) {
++		got = req.Header.Values(proxyMetaHeader)
++	}))
++	require.NoError(t, err)
++
++	raw := "GET / HTTP/1.1\r\nHost: example.com\r\nx-proxy-meta: evil\r\nX-PROXY-META: eviler\r\n\r\n"
++	req, err := http.ReadRequest(bufio.NewReader(strings.NewReader(raw)))
++	require.NoError(t, err)
++	require.Equal(t, []string{"evil", "eviler"}, req.Header.Values(proxyMetaHeader))
++
++	handler.ServeHTTP(httptest.NewRecorder(), req)
++
++	assert.Empty(t, got)
++}
++
+ func TestAddProxyProtocolMetaInContextWithoutProxyProtocol(t *testing.T) {
+ 	client, server := net.Pipe()
+ 	t.Cleanup(func() {
+diff --git a/pkg/server/server_entrypoint_tcp.go b/pkg/server/server_entrypoint_tcp.go
+index 13aaaebe2..852befe00 100644
+--- a/pkg/server/server_entrypoint_tcp.go
++++ b/pkg/server/server_entrypoint_tcp.go
+@@ -635,7 +635,7 @@ func newHTTPServer(ctx context.Context, ln net.Listener, configuration *static.E
+ 
+ 	httpSwitcher := middlewares.NewHandlerSwitcher(http.NotFoundHandler())
+ 
+-	next, err := alice.New(requestdecorator.WrapHandler(reqDecorator)).Then(httpSwitcher)
++	next, err := alice.New(proxyProtocolMeta, requestdecorator.WrapHandler(reqDecorator)).Then(httpSwitcher)
+ 	if err != nil {
+ 		return nil, err
+ 	}

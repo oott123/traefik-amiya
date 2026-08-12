@@ -1,0 +1,165 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: claude <noreply@anthropic.com>
+Date: Wed, 12 Aug 2026 23:24:04 +0800
+Subject: [PATCH] Add the X-Proxy-Meta integration test
+
+Assisted-by: Claude Opus 5
+---
+ integration/proxy_protocol_test.go | 140 +++++++++++++++++++++++++++++
+ 1 file changed, 140 insertions(+)
+
+diff --git a/integration/proxy_protocol_test.go b/integration/proxy_protocol_test.go
+index 893daa718..1bc7812a0 100644
+--- a/integration/proxy_protocol_test.go
++++ b/integration/proxy_protocol_test.go
+@@ -77,6 +77,86 @@ func (s *ProxyProtocolSuite) TestProxyProtocolNotTrusted() {
+ 	assert.Contains(s.T(), content, "X-Forwarded-For: 127.0.0.1")
+ }
+ 
++func (s *ProxyProtocolSuite) TestProxyProtocolTLVMeta() {
++	file := s.adaptFile("fixtures/proxy-protocol/proxy-protocol.toml", struct {
++		HaproxyIP string
++		WhoamiIP  string
++	}{WhoamiIP: s.whoamiIP})
++
++	s.traefikCmd(withConfigFile(file))
++
++	err := try.GetRequest("http://127.0.0.1:8000/whoami", 10*time.Second)
++	require.NoError(s.T(), err)
++
++	err = try.GetRequest("http://127.0.0.1:9000/whoami", 10*time.Second)
++	require.NoError(s.T(), err)
++
++	testCases := []struct {
++		desc         string
++		address      string
++		tlvs         []proxyproto.TLV
++		extraHeaders string
++		expected     []string
++		notExpected  []string
++	}{
++		{
++			desc:     "metadata TLV",
++			address:  "127.0.0.1:8000",
++			tlvs:     []proxyproto.TLV{{Type: 0xF3, Value: []byte("tenant=acme")}},
++			expected: []string{"X-Proxy-Meta: tenant=acme"},
++		},
++		{
++			desc:         "metadata TLV, forged client header",
++			address:      "127.0.0.1:8000",
++			tlvs:         []proxyproto.TLV{{Type: 0xF3, Value: []byte("tenant=acme")}},
++			extraHeaders: "X-Proxy-Meta: evil\r\n",
++			expected:     []string{"X-Proxy-Meta: tenant=acme"},
++			notExpected:  []string{"evil"},
++		},
++		{
++			desc:         "no TLV, forged client header",
++			address:      "127.0.0.1:8000",
++			extraHeaders: "X-Proxy-Meta: evil\r\n",
++			notExpected:  []string{"X-Proxy-Meta"},
++		},
++		{
++			desc:        "metadata TLV with a control character",
++			address:     "127.0.0.1:8000",
++			tlvs:        []proxyproto.TLV{{Type: 0xF3, Value: []byte("bad\x00value")}},
++			notExpected: []string{"X-Proxy-Meta"},
++		},
++		{
++			desc:    "several metadata TLVs",
++			address: "127.0.0.1:8000",
++			tlvs: []proxyproto.TLV{
++				{Type: 0xF3, Value: []byte("first")},
++				{Type: 0xF3, Value: []byte("second")},
++			},
++			expected: []string{"X-Proxy-Meta: first", "X-Proxy-Meta: second"},
++		},
++		{
++			desc:        "metadata TLV from an untrusted upstream",
++			address:     "127.0.0.1:9000",
++			tlvs:        []proxyproto.TLV{{Type: 0xF3, Value: []byte("tenant=acme")}},
++			notExpected: []string{"X-Proxy-Meta"},
++		},
++	}
++
++	for _, test := range testCases {
++		s.Run(test.desc, func() {
++			content, err := proxyProtoRequestWithTLVs(test.address, test.tlvs, test.extraHeaders)
++			require.NoError(s.T(), err)
++
++			for _, expected := range test.expected {
++				assert.Contains(s.T(), content, expected)
++			}
++			for _, notExpected := range test.notExpected {
++				assert.NotContains(s.T(), content, notExpected)
++			}
++		})
++	}
++}
++
+ func proxyProtoRequest(address string, version byte) (string, error) {
+ 	// Open a TCP connection to the server
+ 	conn, err := net.Dial("tcp", address)
+@@ -139,3 +219,63 @@ func proxyProtoRequest(address string, version byte) (string, error) {
+ 
+ 	return content.String(), nil
+ }
++
++// proxyProtoRequestWithTLVs sends a request behind a v2 PROXY protocol header
++// carrying the given TLVs, with extraHeaders appended to the request headers.
++func proxyProtoRequestWithTLVs(address string, tlvs []proxyproto.TLV, extraHeaders string) (string, error) {
++	conn, err := net.Dial("tcp", address)
++	if err != nil {
++		return "", err
++	}
++	defer conn.Close()
++
++	proxyHeader := &proxyproto.Header{
++		Version:           2,
++		Command:           proxyproto.PROXY,
++		TransportProtocol: proxyproto.TCPv4,
++		DestinationAddr: &net.TCPAddr{
++			IP:   net.ParseIP("127.0.0.1"),
++			Port: 8000,
++		},
++		SourceAddr: &net.TCPAddr{
++			IP:   net.ParseIP("1.2.3.4"),
++			Port: 62541,
++		},
++	}
++
++	if err := proxyHeader.SetTLVs(tlvs); err != nil {
++		return "", err
++	}
++
++	if _, err := proxyHeader.WriteTo(conn); err != nil {
++		return "", err
++	}
++
++	request := "GET /whoami HTTP/1.1\r\n" +
++		"Host: 127.0.0.1\r\n" +
++		extraHeaders +
++		"Connection: close\r\n" +
++		"\r\n"
++
++	writer := bufio.NewWriter(conn)
++	if _, err := writer.WriteString(request); err != nil {
++		return "", err
++	}
++
++	if err := writer.Flush(); err != nil {
++		return "", err
++	}
++
++	var content strings.Builder
++	scanner := bufio.NewScanner(conn)
++	for scanner.Scan() {
++		content.WriteString(scanner.Text())
++		content.WriteString("\n")
++	}
++
++	if err := scanner.Err(); err != nil {
++		return "", err
++	}
++
++	return content.String(), nil
++}
