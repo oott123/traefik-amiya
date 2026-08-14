@@ -24,6 +24,10 @@ jobs:
 
       - name: Clone upstream and checkout baseline
         run: ./scripts/setup.sh
+      - name: Configure git identity
+        run: |
+          git config --global user.name "bot"
+          git config --global user.email "user@example.com"
 
       - name: Apply patches
         run: ./scripts/apply.sh
