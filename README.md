@@ -81,6 +81,19 @@ http:
 
 `.references/` 不入库。
 
+## CI 构建
+
+`.github/workflows/build.yaml` 在 push 分支（`master`/`main`）或 push tag `v*`（以及
+`workflow_dispatch` 手动触发）时构建：clone 上游 → 打补丁 → `make binary`（linux amd64/arm64）
+→ 构建 Docker 多架构镜像并推送到 GHCR，镜像名为 `ghcr.io/<owner>/traefik-app-protocol`。
+
+- 分支构建：镜像 tag 为 `latest`，版本号 `<分支名>-<8 位 sha>`。
+- tag 构建：镜像 tag 为 `<tag>` + `latest`，版本号即 `github.ref_name`，并额外创建
+  GitHub release（附件为两个平台的 tar.gz + checksums）。
+
+推送 GHCR 需要仓库开启 `packages: write` 权限（工作流已用内置 `GITHUB_TOKEN` 登录，无需
+额外 secret）。
+
 ## 补丁集布局
 
 `patches/` 按功能分目录，应用顺序由 `patches/SERIES` 声明，一行一个 `<set 名> <commit 数>`：

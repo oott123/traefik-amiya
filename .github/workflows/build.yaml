@@ -1,0 +1,222 @@
+name: Build
+
+on:
+  push:
+    branches: [master, main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Check out code
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          persist-credentials: false
+
+      - name: Clone upstream and checkout baseline
+        run: ./scripts/setup.sh
+
+      - name: Apply patches
+        run: ./scripts/apply.sh
+
+      - name: Enable corepack
+        run: corepack enable
+
+      - name: Set up Node
+        uses: actions/setup-node@6044e13b5dc448c55e2357c09f80417699197238 # v6.2.0
+        with:
+          node-version-file: .references/traefik/webui/.nvmrc
+          cache: yarn
+          cache-dependency-path: .references/traefik/webui/yarn.lock
+
+      - name: Build webui
+        working-directory: .references/traefik/webui
+        run: |
+          yarn install --immutable
+          yarn build
+
+      - name: Package patched source
+        run: |
+          tar --exclude=.git --exclude=webui/node_modules --exclude=.yarn --exclude=dist \
+            -czf patched-source.tar.gz -C .references/traefik .
+
+      - name: Upload patched source
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: patched-source
+          path: patched-source.tar.gz
+          retention-days: 1
+
+      - name: Compute version
+        id: version
+        run: |
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            echo "version=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${GITHUB_REF_NAME}-${GITHUB_SHA:0:8}" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - name: Download patched source
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: patched-source
+
+      - name: Untar patched source
+        run: |
+          mkdir -p traefik
+          tar xzf patched-source.tar.gz -C traefik
+
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version-file: traefik/.go-version
+          cache: false
+
+      - name: Restore go modules cache
+        uses: actions/cache/restore@8b402f58fbc84540c8b491a91e594a4576fec3d7 # v5.0.2
+        with:
+          path: ~/go/pkg/mod
+          key: ${{ runner.os }}-go-mod-${{ hashFiles('traefik/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-mod-
+
+      - name: Build binary
+        working-directory: traefik
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          GOOS: linux
+          GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: '0'
+        run: make binary
+
+      - name: Stage binary
+        run: cp traefik/dist/linux/${{ matrix.arch }}/traefik traefik-${{ matrix.arch }}
+
+      - name: Upload binary
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: linux-${{ matrix.arch }}
+          path: traefik-${{ matrix.arch }}
+          retention-days: 1
+
+  docker:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Download patched source
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: patched-source
+
+      - name: Untar patched source
+        run: |
+          mkdir -p traefik
+          tar xzf patched-source.tar.gz -C traefik
+
+      - name: Download linux-amd64 binary
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: linux-amd64
+          path: binaries
+
+      - name: Download linux-arm64 binary
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: linux-arm64
+          path: binaries
+
+      - name: Place binaries for Dockerfile
+        run: |
+          mkdir -p traefik/dist/linux/amd64 traefik/dist/linux/arm64
+          cp binaries/traefik-amd64 traefik/dist/linux/amd64/traefik
+          cp binaries/traefik-arm64 traefik/dist/linux/arm64/traefik
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+
+      - name: Set up buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        working-directory: traefik
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          args=()
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            args+=("-t" "${IMAGE}:${VERSION}")
+          fi
+          args+=("-t" "${IMAGE}:latest")
+          docker buildx build --push --platform linux/amd64,linux/arm64 \
+            "${args[@]}" -f Dockerfile .
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download linux-amd64 binary
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: linux-amd64
+          path: binaries
+
+      - name: Download linux-arm64 binary
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: linux-arm64
+          path: binaries
+
+      - name: Download patched source
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: patched-source
+
+      - name: Package release assets
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          mkdir -p release
+          tar xzf patched-source.tar.gz -C release ./LICENSE.md ./CHANGELOG.md
+          for arch in amd64 arm64; do
+            cp "binaries/traefik-${arch}" release/traefik
+            tar czf "release/traefik_${VERSION}_linux_${arch}.tar.gz" \
+              -C release traefik LICENSE.md CHANGELOG.md
+            rm -f release/traefik
+          done
+          (cd release && sha256sum traefik_*.tar.gz) > "release/traefik_${VERSION}_checksums.txt"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          gh release create "$VERSION" release/traefik_*.tar.gz release/*_checksums.txt \
+            --title "$VERSION" --generate-notes
