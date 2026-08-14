@@ -1,4 +1,4 @@
-# traepxy
+# traefik-amiya
 
 针对 [Traefik](https://github.com/traefik/traefik) 的补丁集，目前包含两个功能。
 
@@ -70,6 +70,17 @@ http:
 ```
 
 构建需要 Go 1.26。
+
+## 版本与 tag
+
+tag 按 traefik「下一个补丁的预发布版本」命名：上游当前发布的版本是 `vX.Y.Z`，本仓库
+的 tag 就是 `vX.Y.Z+1-amiya.N`（semver 预发布，天然小于正式版 `X.Y.Z+1`）。当前上游
+最新版本为 `v3.7.10`，因此下一个 tag 是 `v3.7.11-amiya.1`；同一目标版本要再发一版
+时递增 `N`（如 `v3.7.11-amiya.2`），基线升级到上游 `v3.7.11` 之后顺延为
+`v3.7.12-amiya.1`。
+
+tag 带 `v` 前缀，会命中 CI 的 `v*` tag 触发规则（见下文「CI 构建」），推送即构建
+镜像并创建 GitHub release。
 
 ## 用法
 
