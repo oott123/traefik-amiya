@@ -9,10 +9,10 @@ Assisted-by: Claude Opus 5
  1 file changed, 79 insertions(+)
 
 diff --git a/docs/content/reference/install-configuration/entrypoints.md b/docs/content/reference/install-configuration/entrypoints.md
-index 9af69551a..9874f2f8e 100644
+index da6c203b5..1d00ef398 100644
 --- a/docs/content/reference/install-configuration/entrypoints.md
 +++ b/docs/content/reference/install-configuration/entrypoints.md
-@@ -490,6 +490,85 @@ When queuing Traefik behind another load-balancer, make sure to configure
+@@ -510,6 +510,85 @@ When queuing Traefik behind another load-balancer, make sure to configure
  PROXY protocol on both sides.
  Not doing so could introduce a security risk in your system (enabling request forgery).
  

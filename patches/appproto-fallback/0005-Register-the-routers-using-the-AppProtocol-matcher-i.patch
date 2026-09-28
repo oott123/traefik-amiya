@@ -7,14 +7,14 @@ Subject: [PATCH] Register the routers using the AppProtocol matcher in the
 Assisted-by: Claude Opus 5
 ---
  pkg/server/router/tcp/manager.go      |  57 ++++++++++++
- pkg/server/router/tcp/manager_test.go | 126 ++++++++++++++++++++++++++
- 2 files changed, 183 insertions(+)
+ pkg/server/router/tcp/manager_test.go | 125 ++++++++++++++++++++++++++
+ 2 files changed, 182 insertions(+)
 
 diff --git a/pkg/server/router/tcp/manager.go b/pkg/server/router/tcp/manager.go
-index 9d023e5a1..9e6451623 100644
+index 55538398c..97464556b 100644
 --- a/pkg/server/router/tcp/manager.go
 +++ b/pkg/server/router/tcp/manager.go
-@@ -255,6 +255,42 @@ func (m *Manager) addTCPHandlers(ctx context.Context, configs map[string]*runtim
+@@ -260,6 +260,42 @@ func (m *Manager) addTCPHandlers(ctx context.Context, configs map[string]*runtim
  			continue
  		}
  
@@ -57,7 +57,7 @@ index 9d023e5a1..9e6451623 100644
  		var handler tcp.Handler
  		if routerConfig.TLS == nil || routerConfig.TLS.Passthrough {
  			handler, err = m.buildTCPHandler(ctxRouter, routerConfig)
-@@ -355,6 +391,27 @@ func (m *Manager) addTCPHandlers(ctx context.Context, configs map[string]*runtim
+@@ -360,6 +396,27 @@ func (m *Manager) addTCPHandlers(ctx context.Context, configs map[string]*runtim
  	}
  }
  
@@ -86,18 +86,10 @@ index 9d023e5a1..9e6451623 100644
  	var qualifiedNames []string
  	for _, name := range router.Middlewares {
 diff --git a/pkg/server/router/tcp/manager_test.go b/pkg/server/router/tcp/manager_test.go
-index 50301b354..a6373a122 100644
+index 65ae5afd5..0993e1fbe 100644
 --- a/pkg/server/router/tcp/manager_test.go
 +++ b/pkg/server/router/tcp/manager_test.go
-@@ -5,6 +5,7 @@ import (
- 	"testing"
- 
- 	"github.com/stretchr/testify/assert"
-+	"github.com/stretchr/testify/require"
- 	"github.com/traefik/traefik/v3/pkg/config/dynamic"
- 	"github.com/traefik/traefik/v3/pkg/config/runtime"
- 	tcpmiddleware "github.com/traefik/traefik/v3/pkg/server/middleware/tcp"
-@@ -397,3 +398,128 @@ func TestRuntimeConfiguration(t *testing.T) {
+@@ -483,3 +483,128 @@ func TestConflictingTLSOptions(t *testing.T) {
  		})
  	}
  }

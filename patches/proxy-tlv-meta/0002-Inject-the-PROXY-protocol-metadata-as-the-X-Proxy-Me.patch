@@ -151,10 +151,10 @@ index 3e3d946e5..18be8ab06 100644
  	client, server := net.Pipe()
  	t.Cleanup(func() {
 diff --git a/pkg/server/server_entrypoint_tcp.go b/pkg/server/server_entrypoint_tcp.go
-index 13aaaebe2..852befe00 100644
+index b4d6abe9b..4463f061b 100644
 --- a/pkg/server/server_entrypoint_tcp.go
 +++ b/pkg/server/server_entrypoint_tcp.go
-@@ -635,7 +635,7 @@ func newHTTPServer(ctx context.Context, ln net.Listener, configuration *static.E
+@@ -658,7 +658,7 @@ func newHTTPServer(ctx context.Context, ln net.Listener, configuration *static.E
  
  	httpSwitcher := middlewares.NewHandlerSwitcher(http.NotFoundHandler())
  

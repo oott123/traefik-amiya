@@ -9,7 +9,7 @@ Assisted-by: Claude Opus 5
  1 file changed, 172 insertions(+)
 
 diff --git a/docs/content/reference/routing-configuration/tcp/routing/rules-and-priority.md b/docs/content/reference/routing-configuration/tcp/routing/rules-and-priority.md
-index 7f5e0a166..e5f69c223 100644
+index 9a1a1e323..00b1029e9 100644
 --- a/docs/content/reference/routing-configuration/tcp/routing/rules-and-priority.md
 +++ b/docs/content/reference/routing-configuration/tcp/routing/rules-and-priority.md
 @@ -22,6 +22,7 @@ The table below lists all the available matchers:
@@ -20,7 +20,7 @@ index 7f5e0a166..e5f69c223 100644
  
  !!! tip "Backticks or Quotes?"
  
-@@ -141,6 +142,177 @@ Match connections using the ALPN protocol `h2`:
+@@ -149,6 +150,177 @@ Match connections using the ALPN protocol `h2`:
  ALPN(`h2`)
  ```
  

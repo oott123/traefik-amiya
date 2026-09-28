@@ -630,10 +630,10 @@ index 9317194b2..e8928b39c 100644
 +	return connData
 +}
 diff --git a/pkg/server/server_entrypoint_tcp.go b/pkg/server/server_entrypoint_tcp.go
-index 402331828..38b912132 100644
+index f095d7a5a..430fe7298 100644
 --- a/pkg/server/server_entrypoint_tcp.go
 +++ b/pkg/server/server_entrypoint_tcp.go
-@@ -212,7 +212,9 @@ func NewTCPEntryPoint(ctx context.Context, name string, config *static.EntryPoin
+@@ -217,7 +217,9 @@ func NewTCPEntryPoint(ctx context.Context, name string, config *static.EntryPoin
  		return nil, fmt.Errorf("creating HTTP3 server: %w", err)
  	}
  
@@ -644,7 +644,7 @@ index 402331828..38b912132 100644
  
  	tcpSwitcher := &tcp.HandlerSwitcher{}
  	tcpSwitcher.Switch(rt)
-@@ -367,7 +369,7 @@ func (e *TCPEntryPoint) SwitchRouter(rt *tcprouter.Router) {
+@@ -390,7 +392,7 @@ func (e *TCPEntryPoint) SwitchRouter(rt *tcprouter.Router) {
  
  	e.httpServer.Switcher.UpdateHandler(httpHandler)
  

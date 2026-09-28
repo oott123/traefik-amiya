@@ -400,10 +400,10 @@ index 000000000..3e3d946e5
 +	assert.Nil(t, ctx.Value(proxyProtocolMetaKey{}))
 +}
 diff --git a/pkg/server/server_entrypoint_tcp.go b/pkg/server/server_entrypoint_tcp.go
-index 0b9ae096a..13aaaebe2 100644
+index ad77ab2ec..b4d6abe9b 100644
 --- a/pkg/server/server_entrypoint_tcp.go
 +++ b/pkg/server/server_entrypoint_tcp.go
-@@ -733,6 +733,8 @@ func newHTTPServer(ctx context.Context, ln net.Listener, configuration *static.E
+@@ -774,6 +774,8 @@ func newHTTPServer(ctx context.Context, ln net.Listener, configuration *static.E
  		return ctx
  	})
  

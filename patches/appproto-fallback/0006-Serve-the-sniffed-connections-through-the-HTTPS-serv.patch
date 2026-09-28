@@ -6,16 +6,16 @@ Subject: [PATCH] Serve the sniffed connections through the HTTPS server
 Assisted-by: Claude Opus 5
 ---
  pkg/server/server_entrypoint_tcp.go      |  53 ++++++++-
- pkg/server/server_entrypoint_tcp_test.go | 140 ++++++++++++++++++++++-
- 2 files changed, 187 insertions(+), 6 deletions(-)
+ pkg/server/server_entrypoint_tcp_test.go | 142 ++++++++++++++++++++++-
+ 2 files changed, 188 insertions(+), 7 deletions(-)
 
 diff --git a/pkg/server/server_entrypoint_tcp.go b/pkg/server/server_entrypoint_tcp.go
-index 38b912132..0b9ae096a 100644
+index 430fe7298..ad77ab2ec 100644
 --- a/pkg/server/server_entrypoint_tcp.go
 +++ b/pkg/server/server_entrypoint_tcp.go
-@@ -195,14 +195,14 @@ func NewTCPEntryPoint(ctx context.Context, name string, config *static.EntryPoin
- 
- 	reqDecorator := requestdecorator.New(hostResolverConfig)
+@@ -200,14 +200,14 @@ func NewTCPEntryPoint(ctx context.Context, name string, config *static.EntryPoin
+ 	// which is called once for the HTTP server and once for the HTTPS server.
+ 	logHeaderNamesStrategiesWarnings(ctx, config)
  
 -	httpServer, err := newHTTPServer(ctx, listener, config, true, reqDecorator)
 +	httpServer, err := newHTTPServer(ctx, listener, config, true, false, reqDecorator)
@@ -30,7 +30,7 @@ index 38b912132..0b9ae096a 100644
  	if err != nil {
  		return nil, fmt.Errorf("creating HTTPS server: %w", err)
  	}
-@@ -619,7 +619,10 @@ type httpServer struct {
+@@ -642,7 +642,10 @@ type httpServer struct {
  	Switcher  *middlewares.HTTPHandlerSwitcher
  }
  
@@ -42,7 +42,7 @@ index 38b912132..0b9ae096a 100644
  	if configuration.HTTP2.MaxConcurrentStreams < 0 {
  		return nil, errors.New("max concurrent streams value must be greater than or equal to zero")
  	}
-@@ -659,7 +662,12 @@ func newHTTPServer(ctx context.Context, ln net.Listener, configuration *static.E
+@@ -682,7 +685,12 @@ func newHTTPServer(ctx context.Context, ln net.Listener, configuration *static.E
  	protocols.SetHTTP2(true)
  
  	// With the addition of UnencryptedHTTP2 in http.Server#Protocols in go1.24 setting the h2c handler is not necessary anymore.
@@ -56,7 +56,7 @@ index 38b912132..0b9ae096a 100644
  
  	handler = contenttype.DisableAutoDetection(handler)
  
-@@ -679,6 +687,10 @@ func newHTTPServer(ctx context.Context, ln net.Listener, configuration *static.E
+@@ -702,6 +710,10 @@ func newHTTPServer(ctx context.Context, ln net.Listener, configuration *static.E
  
  	handler = denyFragment(handler)
  
@@ -64,10 +64,10 @@ index 38b912132..0b9ae096a 100644
 +		handler = restoreTLSState(handler)
 +	}
 +
- 	switch configuration.HTTP.UnderscoreHeadersStrategy {
- 	case "", static.UnderscoreHeadersStrategyKeep:
- 		// Headers with underscores are forwarded as is.
-@@ -701,6 +713,23 @@ func newHTTPServer(ctx context.Context, ln net.Listener, configuration *static.E
+ 	switch configuration.HTTP.AliasHeadersStrategy {
+ 	case "":
+ 		// The aliasHeadersStrategy option is not configured, fall back on the deprecated underscoreHeadersStrategy option.
+@@ -742,6 +754,23 @@ func newHTTPServer(ctx context.Context, ln net.Listener, configuration *static.E
  			}
  		}
  
@@ -91,7 +91,7 @@ index 38b912132..0b9ae096a 100644
  		return ctx
  	})
  
-@@ -800,6 +829,22 @@ func denyFragment(h http.Handler) http.Handler {
+@@ -860,6 +889,22 @@ func denyFragment(h http.Handler) http.Handler {
  	})
  }
  
@@ -111,14 +111,14 @@ index 38b912132..0b9ae096a 100644
 +	})
 +}
 +
- // removeHeadersWithUnderscores removes any request header and trailer whose name contains an underscore character.
- func removeHeadersWithUnderscores(h http.Handler) http.Handler {
- 	return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+ // isAliasingHeaderName reports whether the given header name contains a character which is neither a letter,
+ // a digit, nor a dash, hence making it alias another header name.
+ // Go canonicalizes header names on dashes only, whereas the backends deriving variable names from them
 diff --git a/pkg/server/server_entrypoint_tcp_test.go b/pkg/server/server_entrypoint_tcp_test.go
-index 935b9e7d7..94f5bb15a 100644
+index 38ca91608..52b506765 100644
 --- a/pkg/server/server_entrypoint_tcp_test.go
 +++ b/pkg/server/server_entrypoint_tcp_test.go
-@@ -20,6 +20,7 @@ import (
+@@ -23,6 +23,7 @@ import (
  	"github.com/traefik/traefik/v3/pkg/middlewares/requestdecorator"
  	tcprouter "github.com/traefik/traefik/v3/pkg/server/router/tcp"
  	"github.com/traefik/traefik/v3/pkg/tcp"
@@ -126,7 +126,7 @@ index 935b9e7d7..94f5bb15a 100644
  	"golang.org/x/net/http2"
  )
  
-@@ -674,7 +675,7 @@ func TestPathOperations(t *testing.T) {
+@@ -736,7 +737,7 @@ func TestPathOperations(t *testing.T) {
  	}
  
  	// Create the HTTP server using newHTTPServer.
@@ -135,7 +135,7 @@ index 935b9e7d7..94f5bb15a 100644
  	require.NoError(t, err)
  
  	server.Switcher.UpdateHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-@@ -817,7 +818,7 @@ func TestHTTP2Config(t *testing.T) {
+@@ -879,7 +880,7 @@ func TestHTTP2Config(t *testing.T) {
  	configuration.HTTP2.MaxDecoderHeaderTableSize = int32(expectedDecoderTableSize)
  
  	// Create the HTTP server using newHTTPServer.
@@ -144,7 +144,16 @@ index 935b9e7d7..94f5bb15a 100644
  	require.NoError(t, err)
  
  	// Get the underlying HTTP Server.
-@@ -936,3 +937,138 @@ func Test_rejectHeadersWithUnderscores(t *testing.T) {
+@@ -903,7 +904,7 @@ func TestRequestTargetForms(t *testing.T) {
+ 	configuration := &static.EntryPoint{}
+ 	configuration.SetDefaults()
+ 
+-	server, err := newHTTPServer(t.Context(), ln, configuration, false, requestdecorator.New(nil))
++	server, err := newHTTPServer(t.Context(), ln, configuration, false, false, requestdecorator.New(nil))
+ 	require.NoError(t, err)
+ 
+ 	server.Switcher.UpdateHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+@@ -1470,3 +1471,138 @@ func Test_isAliasingHeaderName(t *testing.T) {
  		})
  	}
  }

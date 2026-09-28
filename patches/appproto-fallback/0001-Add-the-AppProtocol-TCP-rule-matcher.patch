@@ -7,12 +7,12 @@ Assisted-by: Claude Opus 5
 ---
  pkg/muxer/tcp/matcher.go      |  25 +++++
  pkg/muxer/tcp/matcher_test.go | 196 ++++++++++++++++++++++++++++++++++
- pkg/muxer/tcp/mux.go          |  35 ++++++
+ pkg/muxer/tcp/mux.go          |  46 ++++++++
  pkg/muxer/tcp/mux_test.go     |  80 ++++++++++++++
- 4 files changed, 336 insertions(+)
+ 4 files changed, 347 insertions(+)
 
 diff --git a/pkg/muxer/tcp/matcher.go b/pkg/muxer/tcp/matcher.go
-index 0b61dc362..36a991f62 100644
+index 6a212d0f2..43d68980f 100644
 --- a/pkg/muxer/tcp/matcher.go
 +++ b/pkg/muxer/tcp/matcher.go
 @@ -12,8 +12,17 @@ import (
@@ -57,10 +57,10 @@ index 0b61dc362..36a991f62 100644
  	checker, err := ip.NewChecker(clientIP)
  	if err != nil {
 diff --git a/pkg/muxer/tcp/matcher_test.go b/pkg/muxer/tcp/matcher_test.go
-index 5ba7d8a1e..61594811b 100644
+index 16c2dcbba..76a300614 100644
 --- a/pkg/muxer/tcp/matcher_test.go
 +++ b/pkg/muxer/tcp/matcher_test.go
-@@ -383,3 +383,199 @@ func Test_ALPN(t *testing.T) {
+@@ -413,3 +413,199 @@ func Test_ALPN(t *testing.T) {
  		})
  	}
  }
@@ -261,10 +261,10 @@ index 5ba7d8a1e..61594811b 100644
 +	}
 +}
 diff --git a/pkg/muxer/tcp/mux.go b/pkg/muxer/tcp/mux.go
-index 08436c5bb..8fddcd6d4 100644
+index 76a78cf56..0f1ba9a0d 100644
 --- a/pkg/muxer/tcp/mux.go
 +++ b/pkg/muxer/tcp/mux.go
-@@ -19,6 +19,9 @@ type ConnData struct {
+@@ -20,6 +20,9 @@ type ConnData struct {
  	serverName string
  	remoteIP   string
  	alpnProtos []string
@@ -274,7 +274,7 @@ index 08436c5bb..8fddcd6d4 100644
  }
  
  // NewConnData builds a connData struct from the given parameters.
-@@ -38,6 +41,15 @@ func NewConnData(serverName string, remoteAddr net.Addr, alpnProtos []string) (C
+@@ -39,6 +42,15 @@ func NewConnData(serverName string, remoteAddr net.Addr, alpnProtos []string) (C
  	}, nil
  }
  
@@ -290,11 +290,11 @@ index 08436c5bb..8fddcd6d4 100644
  // Muxer defines a muxer that handles TCP routing with rules.
  type Muxer struct {
  	routes routes
-@@ -184,6 +196,29 @@ func (m *Muxer) HasRoutes() bool {
+@@ -178,6 +190,40 @@ func (m *Muxer) HasRoutes() bool {
  	return len(m.routes) > 0
  }
  
-+// HasAppProtocolMatcher returns whether the given rule uses the AppProtocol matcher.
++// HasAppProtocolMatcher returns whether the given rule uses the AppProtocol matcher, negated or not.
 +// It relies on the muxer parsers, and not on a dedicated one, so that a rule using
 +// AppProtocol with the v2 syntax reports the unknown matcher error instead of being
 +// silently accepted.
@@ -314,17 +314,28 @@ index 08436c5bb..8fddcd6d4 100644
 +		return false, fmt.Errorf("error while parsing rule %s", rule)
 +	}
 +
-+	return len(buildTree().ParseMatchers([]string{"AppProtocol"})) > 0, nil
++	return treeHasMatcher(buildTree(), "AppProtocol"), nil
 +}
 +
- // ParseHostSNI extracts the HostSNIs declared in a rule.
++// treeHasMatcher returns whether the given matcher appears in the tree.
++// Unlike Tree.ParsePositiveMatchers, it also reports the negated occurrences:
++// a router using !AppProtocol still depends on the sniffed protocol.
++func treeHasMatcher(tree *rules.Tree, matcher string) bool {
++	if tree == nil {
++		return false
++	}
++
++	return tree.Matcher == matcher || treeHasMatcher(tree.RuleLeft, matcher) || treeHasMatcher(tree.RuleRight, matcher)
++}
++
+ // ParseHostSNI extracts the positive HostSNI matchers values (not negated) declared in a rule.
  // This is a first naive implementation used in TCP routing.
  func ParseHostSNI(rule string) ([]string, error) {
 diff --git a/pkg/muxer/tcp/mux_test.go b/pkg/muxer/tcp/mux_test.go
-index ea1759df3..0420bef9c 100644
+index 4314ebbe5..6495eb4f4 100644
 --- a/pkg/muxer/tcp/mux_test.go
 +++ b/pkg/muxer/tcp/mux_test.go
-@@ -567,3 +567,83 @@ func (f fakeAddr) String() string {
+@@ -606,3 +606,83 @@ func (f fakeAddr) String() string {
  func (f fakeAddr) Network() string {
  	panic("Implement me")
  }
