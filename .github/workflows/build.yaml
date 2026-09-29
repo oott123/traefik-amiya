@@ -152,6 +152,8 @@ jobs:
           mkdir -p traefik/dist/linux/amd64 traefik/dist/linux/arm64
           cp binaries/traefik-amd64 traefik/dist/linux/amd64/traefik
           cp binaries/traefik-arm64 traefik/dist/linux/arm64/traefik
+          # artifact 上传/下载会丢失可执行位，否则容器内 exec /traefik 报 permission denied
+          chmod +x traefik/dist/linux/*/traefik
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
@@ -211,6 +213,7 @@ jobs:
           tar xzf patched-source.tar.gz -C release ./LICENSE.md ./CHANGELOG.md
           for arch in amd64 arm64; do
             cp "binaries/traefik-${arch}" release/traefik
+            chmod +x release/traefik
             tar czf "release/traefik_${VERSION}_linux_${arch}.tar.gz" \
               -C release traefik LICENSE.md CHANGELOG.md
             rm -f release/traefik
